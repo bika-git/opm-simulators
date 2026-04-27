@@ -64,7 +64,7 @@ struct CprPolicyFeatures {
             c01(nl_residual_reduce),
             c01(nl_iteration / 20.0),
             static_cast<float>(std::log1p(nnz_per_row) / 5.0),
-            c01(std::log10(std::max(diag_dominance, 1.0)) / 10.0),
+            c01(diag_dominance / 4.0),
             c01(prev_linsolver_iters / 50.0),
             static_cast<float>(std::clamp(prev_solve_failed, 0.0, 1.0)),
             c01(time_elapsed_frac),

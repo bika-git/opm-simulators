@@ -99,8 +99,7 @@ def normalise(row: dict) -> np.ndarray:
         c01(float(row["nl_residual_reduce"])),
         c01(float(row["nl_iteration"]) / 20.0),
         math.log1p(float(row["nnz_per_row"])) / 5.0,
-        # log10-scale: maps [1, 1e10] → [0, 1]; values < 1 clip to 0
-        c01(math.log10(max(float(row["diag_dominance"]), 1.0)) / 10.0),
+        c01(float(row["diag_dominance"]) / 4.0),
         c01(float(row["prev_linsolver_iters"]) / 50.0),
         float(np.clip(float(row["prev_solve_failed"]), 0.0, 1.0)),
         c01(float(row["time_elapsed_frac"])),
