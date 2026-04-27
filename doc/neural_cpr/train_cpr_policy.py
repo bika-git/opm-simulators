@@ -2,7 +2,7 @@
 """
 Train and export the NeuralCprPolicy MLP.
 
-Architecture:  Dense(14→64, relu) → Dense(64→32, relu) → Dense(32→24, linear)
+Architecture:  Dense(14→32, relu) → Dense(32→24, linear)
 Output:        24 logits over the joint 3×2×2×2 action space
                index i → dec=i//8, cprw=(i//4)%2, fine=(i//2)%2, coarse=i%2
 Optimizer:     AdamW with cosine learning-rate decay and early stopping.
@@ -27,7 +27,6 @@ import csv
 import math
 import os
 import struct
-import sys
 
 import numpy as np
 
@@ -76,84 +75,69 @@ def normalise(row: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Improved MLP  14→64→32→24
+# MLP  14→32→24
 # ---------------------------------------------------------------------------
 
 class MLP:
-    """Three-layer MLP: 14→64 (relu) → 64→32 (relu) → 32→24 (linear)."""
+    """Two-layer MLP: 14→32 (relu) → 32→24 (linear).
+
+    Smaller than the previous 3-layer design; better regularised for the
+    ~5 k tabular training samples typical of a CPR sweep dataset.
+    Parameter count: 14×32+32 + 32×24+24 = 1 272.
+    """
 
     def __init__(self, seed: int = 42):
         rng = np.random.default_rng(seed)
-        self.W1 = rng.standard_normal((64, 14)).astype(np.float32) * math.sqrt(2 / 14)
-        self.b1 = np.zeros(64, dtype=np.float32)
-        self.W2 = rng.standard_normal((32, 64)).astype(np.float32) * math.sqrt(2 / 64)
-        self.b2 = np.zeros(32, dtype=np.float32)
-        self.W3 = rng.standard_normal((24, 32)).astype(np.float32) * math.sqrt(2 / 32)
-        self.b3 = np.zeros(24, dtype=np.float32)
-
-        # Adam moment buffers
+        self.W1 = rng.standard_normal((32, 14)).astype(np.float32) * math.sqrt(2 / 14)
+        self.b1 = np.zeros(32, dtype=np.float32)
+        self.W2 = rng.standard_normal((24, 32)).astype(np.float32) * math.sqrt(2 / 32)
+        self.b2 = np.zeros(24, dtype=np.float32)
         self._init_adam()
 
     def _init_adam(self):
-        self._m = {k: np.zeros_like(v)
-                   for k, v in self._params().items()}
-        self._v = {k: np.zeros_like(v)
-                   for k, v in self._params().items()}
+        self._m = {k: np.zeros_like(v) for k, v in self._params().items()}
+        self._v = {k: np.zeros_like(v) for k, v in self._params().items()}
         self._t = 0
 
     def _params(self):
         return {"W1": self.W1, "b1": self.b1,
-                "W2": self.W2, "b2": self.b2,
-                "W3": self.W3, "b3": self.b3}
+                "W2": self.W2, "b2": self.b2}
 
     def forward(self, x: np.ndarray) -> tuple:
-        """Return (logits, cache) for backprop."""
-        h1_pre = self.W1 @ x + self.b1
-        h1 = np.maximum(0, h1_pre)
-        h2_pre = self.W2 @ h1 + self.b2
-        h2 = np.maximum(0, h2_pre)
-        logits = self.W3 @ h2 + self.b3
-        return logits, (x, h1_pre, h1, h2_pre, h2)
+        h_pre = self.W1 @ x + self.b1
+        h     = np.maximum(0, h_pre)
+        logits = self.W2 @ h + self.b2
+        return logits, (x, h_pre, h)
 
     def predict(self, x: np.ndarray) -> int:
         logits, _ = self.forward(x)
         return int(np.argmax(logits[:24]))
 
-    def backward(self, cache, y: int, label_smooth: float = 0.1
-                 ) -> tuple[float, dict]:
-        x, h1_pre, h1, h2_pre, h2 = cache
-        logits_cache = self.W3 @ h2 + self.b3
+    def backward(self, cache, y: int, label_smooth: float = 0.1) -> tuple[float, dict]:
+        x, h_pre, h = cache
+        logits = self.W2 @ h + self.b2
 
-        # Label-smoothed cross-entropy
-        logits_s = logits_cache - logits_cache.max()
-        exp = np.exp(logits_s)
+        logits_s = logits - logits.max()
+        exp  = np.exp(logits_s)
         prob = exp / exp.sum()
-        n = len(logits_cache)
+        n    = len(logits)
         target = np.full(n, label_smooth / n, dtype=np.float32)
         target[y] += 1.0 - label_smooth
         loss = -(target * np.log(prob + 1e-12)).sum()
 
         d_logits = prob - target
+        dW2 = np.outer(d_logits, h)
+        db2 = d_logits
+        dh  = self.W2.T @ d_logits
+        dh_pre = dh * (h_pre > 0)
+        dW1 = np.outer(dh_pre, x)
+        db1 = dh_pre
 
-        dW3 = np.outer(d_logits, h2)
-        db3 = d_logits
-        dh2 = self.W3.T @ d_logits
-        dh2_pre = dh2 * (h2_pre > 0)
-        dW2 = np.outer(dh2_pre, h1)
-        db2 = dh2_pre
-        dh1 = self.W2.T @ dh2_pre
-        dh1_pre = dh1 * (h1_pre > 0)
-        dW1 = np.outer(dh1_pre, x)
-        db1 = dh1_pre
-
-        return loss, {"W1": dW1, "b1": db1,
-                      "W2": dW2, "b2": db2,
-                      "W3": dW3, "b3": db3}
+        return loss, {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2}
 
     def adam_step(self, grads: dict, lr: float,
                   beta1: float = 0.9, beta2: float = 0.999,
                   eps: float = 1e-8, wd: float = 1e-4):
-        """AdamW update (weight decay applied to weights, not biases)."""
         self._t += 1
         t = self._t
         params = self._params()
@@ -200,7 +184,6 @@ def train(features: list[np.ndarray], labels: list[int],
             model.adam_step(grads, lr)
             total_loss += loss
 
-        # Validation
         if val_features is not None:
             vl = sum(
                 model.backward(model.forward(f)[1], l)[0]
@@ -235,7 +218,6 @@ def train(features: list[np.ndarray], labels: list[int],
                 print(f"  epoch {epoch+1:4d}/{epochs}  lr={lr:.2e}  "
                       f"loss={total_loss/n:.4f}  acc={tr_acc:.3f}")
 
-    # Restore best validation checkpoint
     if best_state is not None:
         for k, v in best_state.items():
             getattr(model, k)[...] = v
@@ -245,7 +227,7 @@ def train(features: list[np.ndarray], labels: list[int],
 
 
 # ---------------------------------------------------------------------------
-# Kerasify export
+# Export
 # ---------------------------------------------------------------------------
 
 def export_opm_kerasify(model: MLP, out_path: str):
@@ -254,18 +236,11 @@ def export_opm_kerasify(model: MLP, out_path: str):
             "opm.ml not found — use --format=binary instead.\n"
             "Install opm-common's Python package to enable Kerasify export."
         )
-    layers = [
-        Dense(14, 64, "relu"),
-        Dense(64, 32, "relu"),
-        Dense(32, 24, "linear"),
-    ]
+    layers = [Dense(14, 32, "relu"), Dense(32, 24, "linear")]
     layers[0].weights = model.W1.T   # Dense stores (in, out)
     layers[0].biases  = model.b1
     layers[1].weights = model.W2.T
     layers[1].biases  = model.b2
-    layers[2].weights = model.W3.T
-    layers[2].biases  = model.b3
-
     export_model(Sequential(layers), out_path)
     print(f"Exported Kerasify model → {out_path}")
 
@@ -277,10 +252,10 @@ def export_binary_fallback(model: MLP, out_path: str):
     ACT_RELU    = 2
 
     with open(out_path, "wb") as f:
-        f.write(struct.pack("<I", 3))  # num_layers
+        f.write(struct.pack("<I", 2))  # num_layers
         for (W, b), act in zip(
-            [(model.W1, model.b1), (model.W2, model.b2), (model.W3, model.b3)],
-            [ACT_RELU, ACT_RELU, ACT_LINEAR],
+            [(model.W1, model.b1), (model.W2, model.b2)],
+            [ACT_RELU, ACT_LINEAR],
         ):
             out_dim, in_dim = W.shape
             f.write(struct.pack("<I", LAYER_DENSE))
@@ -314,17 +289,17 @@ def load_csv(path: str) -> tuple[list[np.ndarray], list[int]]:
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data",    required=True,
+    parser.add_argument("--data",     required=True,
                         help="CSV from collect_sweep_labels.py")
-    parser.add_argument("--out",     default="cpr_policy.model")
-    parser.add_argument("--epochs",  type=int,   default=300)
-    parser.add_argument("--lr",      type=float, default=3e-3,
+    parser.add_argument("--out",      default="cpr_policy.model")
+    parser.add_argument("--epochs",   type=int,   default=300)
+    parser.add_argument("--lr",       type=float, default=3e-3,
                         help="Peak learning rate for cosine schedule")
-    parser.add_argument("--val-frac",type=float, default=0.15,
+    parser.add_argument("--val-frac", type=float, default=0.15,
                         help="Validation fraction for early stopping")
-    parser.add_argument("--patience",type=int,   default=30)
-    parser.add_argument("--seed",    type=int,   default=42)
-    parser.add_argument("--format",  choices=["kerasify","binary"],
+    parser.add_argument("--patience", type=int,   default=30)
+    parser.add_argument("--seed",     type=int,   default=42)
+    parser.add_argument("--format",   choices=["kerasify", "binary"],
                         default="kerasify")
     args = parser.parse_args()
 
@@ -333,7 +308,6 @@ def main():
     n = len(features)
     print(f"  {n} samples, {len(set(labels))} distinct labels (of 24)")
 
-    # Shuffle and split
     rng = np.random.default_rng(args.seed)
     perm = rng.permutation(n)
     val_n = max(1, int(n * args.val_frac))
@@ -344,7 +318,7 @@ def main():
     va_l = [labels[i]   for i in val_idx]
     print(f"  Train: {len(tr_f)}  Val: {len(va_f)}")
 
-    print(f"Training (14→64→32→24, AdamW, cosine LR, patience={args.patience}) ...")
+    print(f"Training (14→32→24, AdamW, cosine LR, patience={args.patience}) ...")
     model = train(tr_f, tr_l, va_f, va_l,
                   epochs=args.epochs, lr_max=args.lr,
                   patience=args.patience, seed=args.seed)

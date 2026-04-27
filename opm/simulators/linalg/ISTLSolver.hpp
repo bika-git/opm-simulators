@@ -356,10 +356,19 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             const char* path = std::getenv("OPM_NEURAL_CPR_WEIGHTS");
             neural_policy_ = std::make_unique<NeuralCprPolicy>(path ? path : "");
             const bool rank0 = (simulator_.gridView().comm().rank() == 0);
+
+            // Minimum softmax probability required before switching configs.
+            // Below threshold the current config is reused, avoiding rebuilds
+            // triggered by low-confidence predictions.  Default 0.6.
+            const char* thr_env = std::getenv("OPM_NEURAL_CPR_CONFIDENCE");
+            confidence_threshold_ = thr_env ? std::stof(thr_env) : 0.6f;
+
             if (rank0) {
                 if (neural_policy_->isLoaded())
                     OpmLog::info("NeuralCprPolicy: loaded model from "
-                                 + std::string(path));
+                                 + std::string(path)
+                                 + " (confidence threshold "
+                                 + std::to_string(confidence_threshold_) + ")");
                 else
                     OpmLog::info("NeuralCprPolicy: active (rule-based fallback)");
             }
@@ -498,11 +507,18 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 return;
 
             CprPolicyFeatures feat = extractFeatures(M);
-            CprPolicyAction cfg = neural_policy_->predict(feat);
+            float confidence = 0.0f;
+            CprPolicyAction cfg = neural_policy_->predict(feat, &confidence);
 
             // On a failed previous solve revert to the safe default config.
             if (last_solve_failed_)
                 cfg = CprPolicyAction{};
+
+            // Below confidence threshold: keep the existing config to avoid
+            // rebuilds triggered by uncertain predictions.  On the very first
+            // call (no current config) we proceed regardless.
+            if (policy_cfg_valid_ && confidence < confidence_threshold_)
+                return;
 
             // Tier 2: config unchanged — nothing to do.
             if (policy_cfg_valid_ && cfg == last_policy_cfg_)
@@ -607,8 +623,13 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
                 if (sweep_log_) {
                     // Sweep mode: record features; use static --linear-solver config.
-                    last_feat_       = extractFeatures(M);
+                    last_feat_        = extractFeatures(M);
                     last_episode_idx_ = simulator_.episodeIndex();
+                    // Keep prev_* in sync so dt_ratio and nl_residual_reduce are
+                    // meaningful on the next Newton step (these are normally updated
+                    // in applyNeuralPolicy() which is skipped in sweep mode).
+                    prev_dt_            = simulator_.timeStepSize();
+                    prev_residual_norm_ = last_feat_.nl_residual_norm;
                     auto t0 = std::chrono::steady_clock::now();
                     prepareFlexibleSolver();
                     last_setup_ms_ = std::chrono::duration<double, std::milli>(
@@ -956,6 +977,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
         // Neural CPR policy members
         std::unique_ptr<NeuralCprPolicy> neural_policy_;
+        float           confidence_threshold_ = 0.6f;  ///< min softmax prob to allow a config switch
         bool            last_solve_failed_    = false;
         bool            policy_cfg_valid_     = false;  ///< true once last_policy_cfg_ is set
         CprPolicyAction last_policy_cfg_;               ///< last action written into prm_

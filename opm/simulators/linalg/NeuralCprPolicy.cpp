@@ -51,20 +51,35 @@ NeuralCprPolicy::NeuralCprPolicy(const std::string& model_path)
 // Inference
 // ---------------------------------------------------------------------------
 
-CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat) const
+CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
+                                          float* out_confidence) const
 {
-    if (!valid_)
+    if (!valid_) {
+        if (out_confidence) *out_confidence = 1.0f;
         return ruleBasedPredict(feat);
+    }
 
-    // Fill a 1-D input tensor with the normalised feature vector.
     auto arr = feat.toArray();
     Opm::ML::Tensor<float> in(CprPolicyFeatures::kNumFeatures);
     for (int i = 0; i < CprPolicyFeatures::kNumFeatures; ++i)
         in(i) = arr[i];
 
     Opm::ML::Tensor<float> out;
-    if (!model_.apply(in, out) || static_cast<int>(out.data_.size()) < 24)
+    if (!model_.apply(in, out) || static_cast<int>(out.data_.size()) < 24) {
+        if (out_confidence) *out_confidence = 1.0f;
         return ruleBasedPredict(feat);
+    }
+
+    if (out_confidence) {
+        // Softmax over 24 logits, numerically stable.
+        const auto* d  = out.data_.data();
+        float max_l    = *std::max_element(d, d + 24);
+        float sum      = 0.f;
+        for (int i = 0; i < 24; ++i) sum += std::exp(d[i] - max_l);
+        const int best = static_cast<int>(
+            std::max_element(d, d + 24) - d);
+        *out_confidence = std::exp(d[best] - max_l) / sum;
+    }
 
     return decodeLogits(out.data_);
 }
