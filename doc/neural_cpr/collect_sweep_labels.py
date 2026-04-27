@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Combine per-Newton-step CSV files from the four-config sweep and assign
-a label (best config index) to each (episode, newton_iter) sample.
+Combine per-Newton-step CSV files from the sweep and assign a label
+(best config index) to each (deck, episode, newton_iter) sample.
 
 Usage
 -----
 python collect_sweep_labels.py \\
-    --csvs /tmp/sweep_spe9_*.csv /tmp/sweep_norne_*.csv \\
+    --csvs /tmp/sweep3/*.csv /tmp/sweep4/*.csv \\
     --out  training_data.csv
 
-Each input CSV was produced by running flow with OPM_CPR_SWEEP_LOG set.
+Each input CSV was produced by run_sweep.py / OPM_CPR_SWEEP_LOG.
+The filename must follow the pattern  <deck_stem>_<NN>.csv  where NN is
+the two-digit config label (0–23), as written by run_sweep.py.
+
 One row per linear solve, columns:
-  config, episode, newton_iter, total_ms, <14 raw features...>
+  config, episode, newton_iter, total_ms, <feature cols...>
 
 Output CSV has the same feature columns plus:
+  deck          — reservoir model identifier (from filename)
   best_config   — winning config string ("cprw:trueimpes:dilu:ilu0" etc.)
   label         — integer 0-23 (joint 3×2×2×2 action index)
 """
@@ -71,11 +75,17 @@ def main():
 
     total_rows = 0
     for path in args.csvs:
+        # Derive deck identifier from filename: strip the trailing _NN label suffix.
+        stem = Path(path).stem          # e.g. "DROGON_HIST_23"
+        deck = stem[:-3]               # strip "_23"  → "DROGON_HIST"
+
         with open(path, newline="") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
                 total_rows += 1
-                key = (row["episode"], row["newton_iter"])
+                # Include deck so Newton steps from different reservoirs are
+                # never merged together (they share episode/newton_iter numbering).
+                key = (deck, row["episode"], row["newton_iter"])
                 config = row["config"]
                 ms = float(row["total_ms"])
 
@@ -86,9 +96,10 @@ def main():
 
                 if entry["feat"] is None:
                     entry["feat"] = {c: row[c] for c in FEATURE_COLS}
+                    entry["feat"]["deck"] = deck
 
     print(f"Read {total_rows} rows from {len(args.csvs)} files.")
-    print(f"Unique (episode, newton_iter) keys: {len(samples)}")
+    print(f"Unique (deck, episode, newton_iter) keys: {len(samples)}")
 
     out_rows = []
     skipped = 0
@@ -123,7 +134,7 @@ def main():
     for label, count in dist.most_common(10):
         print(f"  label {label:2d}: {count:5d} samples")
 
-    fieldnames = FEATURE_COLS + ["best_config", "label"]
+    fieldnames = ["deck"] + FEATURE_COLS + ["best_config", "label"]
     with open(args.out, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
