@@ -51,10 +51,13 @@
 #include <opm/simulators/linalg/setupPropertyTree.hpp>
 #include <opm/simulators/linalg/AbstractISTLSolver.hpp>
 #include <opm/simulators/linalg/printlinearsolverparameter.hpp>
+#include <opm/simulators/linalg/NeuralCPRFeatures.hpp>
+#include <opm/simulators/linalg/NeuralCPRPolicy.hpp>
 
 #include <fmt/format.h>
 
 #include <any>
+#include <cstdlib>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -321,6 +324,8 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             detail::printLinearSolverParameters(parameters_, activeSolverNum_, prm_,  simulator_.gridView().comm());
 
             element_chunks_ = std::make_unique<ElementChunksType>(simulator_.vanguard().gridView(), Dune::Partitions::all, ThreadManager::maxThreads());
+
+            initNeuralPolicy();
         }
 
         // Drop the cached matrix pointer so initPrepare() sees the next matrix
@@ -339,6 +344,147 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 solverInfo.solver_.reset();
                 solverInfo.op_.reset();
             }
+        }
+
+        /// Load the neural CPR policy from $OPM_NEURAL_CPR_WEIGHTS (if set).
+        void initNeuralPolicy()
+        {
+            const char* path = std::getenv("OPM_NEURAL_CPR_WEIGHTS");
+            neural_policy_ = std::make_unique<NeuralCPRPolicy>(path ? path : "");
+            const bool rank0 = (simulator_.gridView().comm().rank() == 0);
+            if (rank0) {
+                if (neural_policy_->isLoaded())
+                    OpmLog::info("NeuralCPRPolicy: loaded weights from "
+                                 + std::string(path));
+                else
+                    OpmLog::info("NeuralCPRPolicy: active (rule-based fallback)");
+            }
+        }
+
+        /// Extract solver-state features from the current matrix and simulator state.
+        ///
+        /// Two features are cached to avoid redundant work:
+        ///   nnz_per_row    — sparsity pattern is fixed; computed once.
+        ///   diag_dominance — relatively stable; recomputed only on Newton iter 0.
+        NeuralCPRFeatures extractFeatures(const Matrix& M)
+        {
+            NeuralCPRFeatures feat;
+
+            const double dt_s     = simulator_.timeStepSize();
+            feat.dt_days          = dt_s / 86400.0;
+            feat.dt_ratio         = (prev_dt_ > 0.0) ? dt_s / prev_dt_ : 1.0;
+            feat.nl_residual_norm = rhs_->two_norm();
+            feat.nl_residual_reduce = (prev_residual_norm_ > 0.0)
+                                     ? feat.nl_residual_norm / prev_residual_norm_
+                                     : 1.0;
+            feat.nl_iteration = double(
+                simulator_.problem().iterationContext().iteration());
+
+            // nnz_per_row: sparsity pattern is fixed for the whole simulation.
+            if (cached_nnz_per_row_ < 0.0)
+                cached_nnz_per_row_ = (M.N() > 0)
+                    ? double(M.nonzeroes()) / double(M.N()) : 7.0;
+            feat.nnz_per_row = cached_nnz_per_row_;
+
+            // diag_dominance: recompute only on the first Newton step of each
+            // timestep when the matrix reflects the latest linearisation.
+            if (feat.nl_iteration == 0.0)
+                cached_diag_dominance_ = computeDiagDominance(M);
+            feat.diag_dominance = cached_diag_dominance_;
+
+            return feat;
+        }
+
+        /// Cheap diagonal-dominance proxy: sample up to 200 block rows.
+        static double computeDiagDominance(const Matrix& M)
+        {
+            const std::size_t nSample = std::min(M.N(), std::size_t(200));
+            double sumRatio = 0.0;
+            std::size_t count = 0;
+            for (std::size_t i = 0; i < nSample; ++i) {
+                const auto& row = M[i];
+                double diagN = 0.0, offN = 0.0;
+                for (auto it = row.begin(); it != row.end(); ++it) {
+                    const double fn = it->frobenius_norm();
+                    if (it.index() == i) diagN += fn;
+                    else                  offN  += fn;
+                }
+                if (offN > 0.0) { sumRatio += diagN / offN; ++count; }
+            }
+            return (count > 0) ? sumRatio / double(count) : 1.0;
+        }
+
+        /// Run the neural policy and update prm_ for the upcoming solver build.
+        ///
+        /// Three-tier optimisation:
+        ///   Tier 1 — early exit when the solver won't be rebuilt (prm_ is not
+        ///            re-read by the preconditioner update() path).
+        ///   Tier 2 — skip all tree manipulation when the predicted config is
+        ///            identical to the one already in prm_.
+        ///   Tier 3 — patch only the 1–3 changed fields when the preconditioner
+        ///            type is unchanged, rather than rebuilding all 30+ nodes.
+        void applyNeuralPolicy(const Matrix& M)
+        {
+            // Tier 1: prm_ will not be re-read if we are not about to create a
+            // new solver object.  Skip early.
+            if (!shouldCreateSolver())
+                return;
+
+            NeuralCPRFeatures feat = extractFeatures(M);
+            CPRConfig cfg = neural_policy_->predict(feat);
+
+            // On a failed previous solve revert to the safe default config.
+            if (last_solve_failed_)
+                cfg = CPRConfig{};
+
+            // Tier 2: config unchanged — nothing to do.
+            if (policy_cfg_valid_ && cfg == last_policy_cfg_)
+                return;
+
+            const double tol   = prm_[activeSolverNum_].template
+                                 get<double>("tol",     0.005);
+            const int  maxiter = prm_[activeSolverNum_].template
+                                 get<int>("maxiter", 20);
+
+            if (policy_cfg_valid_ && cfg.use_cprw == last_policy_cfg_.use_cprw) {
+                // Tier 3: same preconditioner type — patch only the changed keys.
+                NeuralCPRPolicy::updatePropertyTreeInPlace(
+                    cfg, last_policy_cfg_, prm_[activeSolverNum_]);
+            } else {
+                // Full rebuild needed (first call or type switch).
+                // If the preconditioner type changed, the existing FlexibleSolver
+                // object cannot be reused — force recreation.
+                if (policy_cfg_valid_
+                    && !flexibleSolver_.empty()
+                    && flexibleSolver_[activeSolverNum_].solver_)
+                {
+                    flexibleSolver_[activeSolverNum_].solver_.reset();
+                }
+                prm_[activeSolverNum_] = NeuralCPRPolicy::configToPropertyTree(
+                                             cfg, tol, maxiter);
+            }
+
+            if (simulator_.gridView().comm().rank() == 0)
+                OpmLog::debug("NeuralCPRPolicy: " + policyLogStr(cfg));
+
+            last_policy_cfg_    = cfg;
+            policy_cfg_valid_   = true;
+            prev_dt_            = simulator_.timeStepSize();
+            prev_residual_norm_ = feat.nl_residual_norm;
+        }
+
+        static std::string policyLogStr(const CPRConfig& c)
+        {
+            const char* dec = (c.decoupling == CPRDecoupling::QuasiIMPES)
+                              ? "quasiimpes"
+                              : (c.decoupling == CPRDecoupling::TrueIMPES)
+                                ? "trueimpes" : "trueimpesanalytic";
+            return std::string(c.use_cprw ? "cprw" : "cpr")
+                   + " weight=" + dec
+                   + " fine="   + (c.fine   == CPRFineSmoother::DILU
+                                   ? "dilu" : "paroverilu0")
+                   + " coarse=" + (c.coarse == CPRCoarseSmoother::DILU
+                                   ? "dilu" : "ilu0");
         }
 
         void setActiveSolver(const int num) override
@@ -396,7 +542,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         {
             OPM_TIMEBLOCK(istlSolverPrepare);
             try {
-                initPrepare(M,b);
+                initPrepare(M, b);
+
+                if (neural_policy_)
+                    applyNeuralPolicy(M);
 
                 prepareFlexibleSolver();
             }
@@ -462,7 +611,8 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             iterations_ = result.iterations;
 
             // Check convergence, iterations etc.
-            return checkConvergence(result);
+            last_solve_failed_ = !checkConvergence(result);
+            return !last_solve_failed_;
         }
 
 
@@ -726,6 +876,18 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         // set when initPrepare detects a different matrix object; cleared by
         // shouldCreateSolver() (hence mutable in an otherwise const query)
         mutable bool force_recreate_ = false;
+
+        // Neural CPR policy members
+        std::unique_ptr<NeuralCPRPolicy> neural_policy_;
+        bool      last_solve_failed_    = false;
+        bool      policy_cfg_valid_     = false;  ///< true once last_policy_cfg_ is set
+        CPRConfig last_policy_cfg_;               ///< last config written into prm_
+        double    prev_dt_              = 0.0;    ///< dt from the previous prepare() call (seconds)
+        double    prev_residual_norm_   = 0.0;    ///< rhs norm from the previous prepare() call
+
+        // Feature caches (avoid recomputing invariants)
+        mutable double cached_nnz_per_row_    = -1.0;  ///< constant after first call
+        mutable double cached_diag_dominance_ =  1.0;  ///< refreshed on Newton iter 0
     }; // end ISTLSolver
 
 } // namespace Opm

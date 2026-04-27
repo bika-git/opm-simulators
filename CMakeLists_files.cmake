@@ -1163,6 +1163,8 @@ list (APPEND PUBLIC_HEADER_FILES
   opm/simulators/linalg/is_gpu_operator.hpp
   opm/simulators/linalg/ISTLSolver.hpp
   opm/simulators/linalg/ISTLSolverRuntimeOptionProxy.hpp
+  opm/simulators/linalg/NeuralCPRFeatures.hpp
+  opm/simulators/linalg/NeuralCPRPolicy.hpp
   opm/simulators/linalg/Preconditioner2InverseOperator.hpp
   opm/simulators/linalg/system/MultiComm.hpp
   opm/simulators/linalg/system/SystemCprwPressureStage.hpp
