@@ -60,7 +60,10 @@ public:
     bool isLoaded() const { return valid_; }
 
     /// Predict the best CPR configuration for the given features.
-    CprPolicyAction predict(const CprPolicyFeatures& feat) const;
+    /// If \p out_confidence is non-null it receives the softmax probability of
+    /// the top label (0–1).  Rule-based mode always writes 1.0.
+    CprPolicyAction predict(const CprPolicyFeatures& feat,
+                            float* out_confidence = nullptr) const;
 
     /// Build a complete PropertyTree mirroring setupCPRW() in
     /// setupPropertyTree.cpp, accepted by FlexibleSolver without modification.

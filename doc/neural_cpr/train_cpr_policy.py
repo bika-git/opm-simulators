@@ -2,10 +2,14 @@
 """
 Train and export the NeuralCprPolicy MLP.
 
-Architecture:  Dense(14→32, relu) → Dense(32→24, linear)
+Architecture:  Dense(14→H, act) → Dense(H→24, linear)
+               H controlled by --hidden (default 32)
+Activations:   relu | tanh | softplus  (--activation, default relu)
 Output:        24 logits over the joint 3×2×2×2 action space
                index i → dec=i//8, cprw=(i//4)%2, fine=(i//2)%2, coarse=i%2
 Optimizer:     AdamW with cosine learning-rate decay and early stopping.
+Loss:          Label-smoothed cross-entropy with optional inverse-frequency
+               class weights (--class-weights) to counter severe imbalance.
 
 Input CSV
 ---------
@@ -27,11 +31,12 @@ import csv
 import math
 import os
 import struct
+from collections import Counter
 
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# opm-common Kerasify export (optional — only needed for model export)
+# opm-common Kerasify export (optional)
 # ---------------------------------------------------------------------------
 try:
     from opm.ml.ml_tools.kerasify import export_model
@@ -39,6 +44,37 @@ try:
     HAS_OPM_ML = True
 except ImportError:
     HAS_OPM_ML = False
+
+# ---------------------------------------------------------------------------
+# Activation helpers  (must map to activation codes the C++ reader accepts)
+# ---------------------------------------------------------------------------
+
+# Binary format activation codes (opm-common ml_model.hpp ActivationType enum)
+ACT_CODE = {"linear": 1, "relu": 2, "softplus": 3, "tanh": 6}
+
+
+def act_forward(name: str, x: np.ndarray) -> np.ndarray:
+    if name == "relu":
+        return np.maximum(0.0, x)
+    if name == "tanh":
+        return np.tanh(x)
+    if name == "softplus":
+        # numerically stable: log(1+exp(x))
+        return np.where(x > 20, x, np.log1p(np.exp(np.minimum(x, 20))))
+    raise ValueError(name)
+
+
+def act_backward(name: str, pre: np.ndarray, act: np.ndarray) -> np.ndarray:
+    """Element-wise derivative of activation w.r.t. its pre-activation input."""
+    if name == "relu":
+        return (pre > 0).astype(np.float32)
+    if name == "tanh":
+        return (1.0 - act ** 2).astype(np.float32)
+    if name == "softplus":
+        # d/dx log(1+exp(x)) = sigmoid(x)
+        return (1.0 / (1.0 + np.exp(-np.clip(pre, -20, 20)))).astype(np.float32)
+    raise ValueError(name)
+
 
 # ---------------------------------------------------------------------------
 # Feature normalisation  (must stay in sync with CprPolicyFeatures::toArray())
@@ -63,7 +99,8 @@ def normalise(row: dict) -> np.ndarray:
         c01(float(row["nl_residual_reduce"])),
         c01(float(row["nl_iteration"]) / 20.0),
         math.log1p(float(row["nnz_per_row"])) / 5.0,
-        c01(float(row["diag_dominance"]) / 4.0),
+        # log10-scale: maps [1, 1e10] → [0, 1]; values < 1 clip to 0
+        c01(math.log10(max(float(row["diag_dominance"]), 1.0)) / 10.0),
         c01(float(row["prev_linsolver_iters"]) / 50.0),
         float(np.clip(float(row["prev_solve_failed"]), 0.0, 1.0)),
         c01(float(row["time_elapsed_frac"])),
@@ -75,22 +112,16 @@ def normalise(row: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# MLP  14→32→24
+# MLP  14→H→24
 # ---------------------------------------------------------------------------
 
 class MLP:
-    """Two-layer MLP: 14→32 (relu) → 32→24 (linear).
-
-    Smaller than the previous 3-layer design; better regularised for the
-    ~5 k tabular training samples typical of a CPR sweep dataset.
-    Parameter count: 14×32+32 + 32×24+24 = 1 272.
-    """
-
-    def __init__(self, seed: int = 42):
+    def __init__(self, hidden: int = 32, activation: str = "relu", seed: int = 42):
         rng = np.random.default_rng(seed)
-        self.W1 = rng.standard_normal((32, 14)).astype(np.float32) * math.sqrt(2 / 14)
-        self.b1 = np.zeros(32, dtype=np.float32)
-        self.W2 = rng.standard_normal((24, 32)).astype(np.float32) * math.sqrt(2 / 32)
+        self.activation = activation
+        self.W1 = rng.standard_normal((hidden, 14)).astype(np.float32) * math.sqrt(2 / 14)
+        self.b1 = np.zeros(hidden, dtype=np.float32)
+        self.W2 = rng.standard_normal((24, hidden)).astype(np.float32) * math.sqrt(2 / hidden)
         self.b2 = np.zeros(24, dtype=np.float32)
         self._init_adam()
 
@@ -104,8 +135,8 @@ class MLP:
                 "W2": self.W2, "b2": self.b2}
 
     def forward(self, x: np.ndarray) -> tuple:
-        h_pre = self.W1 @ x + self.b1
-        h     = np.maximum(0, h_pre)
+        h_pre  = self.W1 @ x + self.b1
+        h      = act_forward(self.activation, h_pre)
         logits = self.W2 @ h + self.b2
         return logits, (x, h_pre, h)
 
@@ -113,23 +144,25 @@ class MLP:
         logits, _ = self.forward(x)
         return int(np.argmax(logits[:24]))
 
-    def backward(self, cache, y: int, label_smooth: float = 0.1) -> tuple[float, dict]:
+    def backward(self, cache, y: int,
+                 label_smooth: float = 0.1,
+                 sample_weight: float = 1.0) -> tuple[float, dict]:
         x, h_pre, h = cache
         logits = self.W2 @ h + self.b2
 
         logits_s = logits - logits.max()
-        exp  = np.exp(logits_s)
-        prob = exp / exp.sum()
-        n    = len(logits)
-        target = np.full(n, label_smooth / n, dtype=np.float32)
+        exp      = np.exp(logits_s)
+        prob     = exp / exp.sum()
+        n        = len(logits)
+        target   = np.full(n, label_smooth / n, dtype=np.float32)
         target[y] += 1.0 - label_smooth
-        loss = -(target * np.log(prob + 1e-12)).sum()
+        loss = sample_weight * -(target * np.log(prob + 1e-12)).sum()
 
-        d_logits = prob - target
+        d_logits = sample_weight * (prob - target)
         dW2 = np.outer(d_logits, h)
         db2 = d_logits
         dh  = self.W2.T @ d_logits
-        dh_pre = dh * (h_pre > 0)
+        dh_pre = dh * act_backward(self.activation, h_pre, h)
         dW1 = np.outer(dh_pre, x)
         db1 = dh_pre
 
@@ -151,6 +184,23 @@ class MLP:
 
 
 # ---------------------------------------------------------------------------
+# Class weights
+# ---------------------------------------------------------------------------
+
+def make_class_weights(labels: list[int], n_classes: int = 24,
+                       cap: float = 10.0) -> np.ndarray:
+    """Inverse-frequency weights, capped at cap × mean weight."""
+    counts = Counter(labels)
+    n = len(labels)
+    raw = np.array([n / max(counts.get(c, 1), 1) for c in range(n_classes)],
+                   dtype=np.float64)
+    mean_w = raw.mean()
+    raw = np.minimum(raw, cap * mean_w)
+    # Normalise so mean = 1
+    return (raw / raw.mean()).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -161,12 +211,15 @@ def cosine_lr(epoch: int, total: int, lr_max: float, lr_min: float = 1e-5) -> fl
 def train(features: list[np.ndarray], labels: list[int],
           val_features: list[np.ndarray] | None = None,
           val_labels:   list[int]        | None = None,
-          epochs: int   = 300,
-          lr_max: float = 3e-3,
-          patience: int = 30,
-          seed: int     = 42) -> MLP:
+          epochs: int        = 300,
+          lr_max: float      = 3e-3,
+          patience: int      = 30,
+          seed: int          = 42,
+          hidden: int        = 32,
+          activation: str    = "relu",
+          class_weights: np.ndarray | None = None) -> MLP:
 
-    model = MLP(seed=seed)
+    model = MLP(hidden=hidden, activation=activation, seed=seed)
     n = len(features)
     idx = np.arange(n)
     best_val_loss = float("inf")
@@ -179,8 +232,9 @@ def train(features: list[np.ndarray], labels: list[int],
         total_loss = 0.0
 
         for i in idx:
+            sw = float(class_weights[labels[i]]) if class_weights is not None else 1.0
             _, cache = model.forward(features[i])
-            loss, grads = model.backward(cache, labels[i])
+            loss, grads = model.backward(cache, labels[i], sample_weight=sw)
             model.adam_step(grads, lr)
             total_loss += loss
 
@@ -233,11 +287,11 @@ def train(features: list[np.ndarray], labels: list[int],
 def export_opm_kerasify(model: MLP, out_path: str):
     if not HAS_OPM_ML:
         raise ImportError(
-            "opm.ml not found — use --format=binary instead.\n"
-            "Install opm-common's Python package to enable Kerasify export."
+            "opm.ml not found — use --format=binary instead."
         )
-    layers = [Dense(14, 32, "relu"), Dense(32, 24, "linear")]
-    layers[0].weights = model.W1.T   # Dense stores (in, out)
+    h = model.W1.shape[0]
+    layers = [Dense(14, h, model.activation), Dense(h, 24, "linear")]
+    layers[0].weights = model.W1.T
     layers[0].biases  = model.b1
     layers[1].weights = model.W2.T
     layers[1].biases  = model.b2
@@ -246,23 +300,22 @@ def export_opm_kerasify(model: MLP, out_path: str):
 
 
 def export_binary_fallback(model: MLP, out_path: str):
-    """Write raw Kerasify binary without opm.ml dependency."""
     LAYER_DENSE = 3
-    ACT_LINEAR  = 1
-    ACT_RELU    = 2
+    ACT_LINEAR  = ACT_CODE["linear"]
+    act_code    = ACT_CODE[model.activation]
 
     with open(out_path, "wb") as f:
-        f.write(struct.pack("<I", 2))  # num_layers
+        f.write(struct.pack("<I", 2))
         for (W, b), act in zip(
             [(model.W1, model.b1), (model.W2, model.b2)],
-            [ACT_RELU, ACT_LINEAR],
+            [act_code, ACT_LINEAR],
         ):
             out_dim, in_dim = W.shape
             f.write(struct.pack("<I", LAYER_DENSE))
             f.write(struct.pack("<I", in_dim))
             f.write(struct.pack("<I", out_dim))
             f.write(struct.pack("<I", out_dim))
-            f.write(W.T.astype(np.float32).tobytes())  # (in, out) row-major
+            f.write(W.T.astype(np.float32).tobytes())
             f.write(b.astype(np.float32).tobytes())
             f.write(struct.pack("<I", act))
 
@@ -289,18 +342,24 @@ def load_csv(path: str) -> tuple[list[np.ndarray], list[int]]:
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data",     required=True,
-                        help="CSV from collect_sweep_labels.py")
-    parser.add_argument("--out",      default="cpr_policy.model")
-    parser.add_argument("--epochs",   type=int,   default=300)
-    parser.add_argument("--lr",       type=float, default=3e-3,
-                        help="Peak learning rate for cosine schedule")
-    parser.add_argument("--val-frac", type=float, default=0.15,
-                        help="Validation fraction for early stopping")
-    parser.add_argument("--patience", type=int,   default=30)
-    parser.add_argument("--seed",     type=int,   default=42)
-    parser.add_argument("--format",   choices=["kerasify", "binary"],
-                        default="kerasify")
+    parser.add_argument("--data",         required=True)
+    parser.add_argument("--out",          default="cpr_policy.model")
+    parser.add_argument("--epochs",       type=int,   default=300)
+    parser.add_argument("--lr",           type=float, default=3e-3)
+    parser.add_argument("--val-frac",     type=float, default=0.15)
+    parser.add_argument("--patience",     type=int,   default=40)
+    parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument("--format",       choices=["kerasify", "binary"],
+                        default="binary")
+    parser.add_argument("--hidden",       type=int,   default=32,
+                        help="Hidden layer width (default 32)")
+    parser.add_argument("--activation",   choices=list(ACT_CODE.keys()),
+                        default="relu",
+                        help="Hidden layer activation (default relu)")
+    parser.add_argument("--class-weights", action="store_true",
+                        help="Weight loss by inverse class frequency")
+    parser.add_argument("--weight-cap",   type=float, default=10.0,
+                        help="Max class weight relative to mean (default 10)")
     args = parser.parse_args()
 
     print(f"Loading {args.data} ...")
@@ -318,10 +377,21 @@ def main():
     va_l = [labels[i]   for i in val_idx]
     print(f"  Train: {len(tr_f)}  Val: {len(va_f)}")
 
-    print(f"Training (14→32→24, AdamW, cosine LR, patience={args.patience}) ...")
+    cw = None
+    if args.class_weights:
+        cw = make_class_weights(tr_l, cap=args.weight_cap)
+        print(f"  Class weights: min={cw[cw>0].min():.2f}  "
+              f"max={cw.max():.2f}  effective={int((cw > 0).sum())}/24  "
+              f"(cap={args.weight_cap}×mean)")
+
+    arch = f"14→{args.hidden}→24"
+    print(f"Training ({arch}, {args.activation}, AdamW, patience={args.patience}"
+          + (", class-weighted" if cw is not None else "") + ") ...")
     model = train(tr_f, tr_l, va_f, va_l,
                   epochs=args.epochs, lr_max=args.lr,
-                  patience=args.patience, seed=args.seed)
+                  patience=args.patience, seed=args.seed,
+                  hidden=args.hidden, activation=args.activation,
+                  class_weights=cw)
 
     if args.format == "kerasify":
         export_opm_kerasify(model, args.out)
