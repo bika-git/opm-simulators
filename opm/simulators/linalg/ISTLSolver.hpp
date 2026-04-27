@@ -58,8 +58,10 @@
 #include <fmt/format.h>
 
 #include <any>
+#include <chrono>
 #include <cstdlib>
 #include <cstddef>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <set>
@@ -348,6 +350,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         }
 
         /// Load the neural CPR policy from $OPM_NEURAL_CPR_WEIGHTS (if set).
+        /// Also opens the sweep log file if OPM_CPR_SWEEP_LOG is set.
         void initNeuralPolicy()
         {
             const char* path = std::getenv("OPM_NEURAL_CPR_WEIGHTS");
@@ -360,6 +363,56 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 else
                     OpmLog::info("NeuralCprPolicy: active (rule-based fallback)");
             }
+
+            const char* log_path = std::getenv("OPM_CPR_SWEEP_LOG");
+            if (log_path && rank0) {
+                sweep_log_ = std::make_unique<std::ofstream>(
+                    log_path, std::ios::app);
+                if (sweep_log_->is_open() && sweep_log_->tellp() == 0) {
+                    *sweep_log_
+                        << "config,episode,newton_iter,total_ms,"
+                           "dt_days,dt_ratio,nl_residual_norm,nl_residual_reduce,"
+                           "nl_iteration,nnz_per_row,diag_dominance,"
+                           "prev_linsolver_iters,prev_solve_failed,"
+                           "time_elapsed_frac,num_cells_log,block_size\n";
+                }
+                OpmLog::info("NeuralCprPolicy: sweep logging to "
+                             + std::string(log_path));
+            }
+        }
+
+        /// Format the current prm_ config as "type:weight:fine:coarse".
+        std::string currentConfigName() const
+        {
+            const auto& p = prm_[activeSolverNum_];
+            return p.template get<std::string>("preconditioner.type",        "cprw")
+                 + ":" + p.template get<std::string>("preconditioner.weight_type",   "trueimpes")
+                 + ":" + p.template get<std::string>("preconditioner.finesmoother.type", "dilu")
+                 + ":" + p.template get<std::string>(
+                             "preconditioner.coarsesolver.preconditioner.smoother", "ilu0");
+        }
+
+        /// Write one row to the sweep CSV.
+        void writeSweepRow(double total_ms)
+        {
+            *sweep_log_
+                << currentConfigName() << ","
+                << last_episode_idx_   << ","
+                << int(last_feat_.nl_iteration) << ","
+                << total_ms            << ","
+                << last_feat_.dt_days              << ","
+                << last_feat_.dt_ratio             << ","
+                << last_feat_.nl_residual_norm     << ","
+                << last_feat_.nl_residual_reduce   << ","
+                << last_feat_.nl_iteration         << ","
+                << last_feat_.nnz_per_row          << ","
+                << last_feat_.diag_dominance       << ","
+                << last_feat_.prev_linsolver_iters << ","
+                << last_feat_.prev_solve_failed    << ","
+                << last_feat_.time_elapsed_frac    << ","
+                << last_feat_.num_cells_log        << ","
+                << last_feat_.block_size           << "\n";
+            sweep_log_->flush();
         }
 
         /// Extract solver-state features from the current matrix and simulator state.
@@ -552,10 +605,19 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             try {
                 initPrepare(M, b);
 
-                if (neural_policy_)
-                    applyNeuralPolicy(M);
-
-                prepareFlexibleSolver();
+                if (sweep_log_) {
+                    // Sweep mode: record features; use static --linear-solver config.
+                    last_feat_       = extractFeatures(M);
+                    last_episode_idx_ = simulator_.episodeIndex();
+                    auto t0 = std::chrono::steady_clock::now();
+                    prepareFlexibleSolver();
+                    last_setup_ms_ = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                } else {
+                    if (neural_policy_)
+                        applyNeuralPolicy(M);
+                    prepareFlexibleSolver();
+                }
             }
             catch (const Dune::MatrixBlockError&) {
                 // Construction or update may have left a partial preconditioner.
@@ -613,7 +675,13 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             {
                 OPM_TIMEBLOCK(flexibleSolverApply);
                 assert(flexibleSolver_[activeSolverNum_].solver_);
+                auto t0 = std::chrono::steady_clock::now();
                 flexibleSolver_[activeSolverNum_].solver_->apply(x, *rhs_, result);
+                if (sweep_log_) {
+                    double solve_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    writeSweepRow(last_setup_ms_ + solve_ms);
+                }
             }
 
             iterations_             = result.iterations;
@@ -898,6 +966,12 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         // Feature caches (avoid recomputing invariants)
         mutable double cached_nnz_per_row_    = -1.0;  ///< permanent after first call
         mutable double cached_diag_dominance_ =  1.0;  ///< refreshed on Newton iter 0
+
+        // Sweep logging (OPM_CPR_SWEEP_LOG)
+        std::unique_ptr<std::ofstream> sweep_log_;
+        CprPolicyFeatures last_feat_{};          ///< features from last extractFeatures()
+        int               last_episode_idx_ = 0; ///< simulator episode index at last prepare()
+        double            last_setup_ms_    = 0.0; ///< prepareFlexibleSolver() wall time (ms)
     }; // end ISTLSolver
 
 } // namespace Opm
