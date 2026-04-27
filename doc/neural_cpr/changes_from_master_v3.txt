@@ -1,0 +1,193 @@
+CHANGES FROM MASTER — neural-cpr-v3 branch
+==========================================
+Model:     cpr_policy_v3_2decks (14→32→24, ReLU, AdamW)
+Trained:   SPE9 + NORNE_ATW2013, 1326 samples, val_acc = 45.5%
+Benchmark: SPE9 −5%, Norne −5.5% wall time vs. rule-based baseline
+
+
+NEW FILES — C++ linalg
+----------------------
+
+opm/simulators/linalg/CprPolicyAction.hpp
+  Purpose: Defines the discrete action space.
+  Content: Three enums (CprWeightType, CprSmoother) and the CprPolicyAction
+    struct holding the four-axis configuration:
+      weight_type     — QuasiIMPES / TrueIMPES / TrueIMPESAnalytic
+      use_cprw        — whether to include well-equation weights
+      fine_smoother   — ParOverILU0 or DILU for the fine level
+      coarse_smoother — ILU0 or DILU inside AMG
+    Label encoding: i = dec*8 + cprw*4 + fine*2 + coarse (0–23, joint 3×2×2×2)
+
+opm/simulators/linalg/CprPolicyFeatures.hpp
+  Purpose: Defines the 14 scalar features fed to the MLP.
+  Content: CprPolicyFeatures struct with named double fields and a toArray()
+    method that normalises each feature to approximately [0, 1]:
+      dt_days              log1p(x) / 7.0
+      dt_ratio             clamp(x / 10.0)
+      nl_residual_norm     (log10(x) + 14) / 14
+      nl_residual_reduce   clamp(x)
+      nl_iteration         clamp(x / 20.0)
+      nnz_per_row          log1p(x) / 5.0
+      diag_dominance       clamp(x / 4.0)   ← NOTE: clips values > 4 to 1.0
+      prev_linsolver_iters clamp(x / 50.0)
+      prev_solve_failed    clamp(x)
+      time_elapsed_frac    clamp(x)
+      num_cells_log        clamp(x / 6.0)
+      block_size           clamp(x / 6.0)
+      pad0, pad1           always 0.0 (reserved)
+
+opm/simulators/linalg/NeuralCPRPolicy.hpp
+  Purpose: Declaration of the NeuralCprPolicy class.
+  Content:
+    - Constructor loads a Kerasify model file (path from OPM_NEURAL_CPR_WEIGHTS)
+    - predict(feat, out_confidence) — MLP inference or rule-based fallback
+    - configToPropertyTree() — builds full 30-node Boost PropertyTree for
+      FlexibleSolver from a CprPolicyAction
+    - updatePropertyTreeInPlace() — patches only the 1–3 changed fields
+    - String helpers: weightTypeStr, fineSmootherStr, coarseSmootherStr
+    - Private: Opm::ML::NNModel<float> model_, bool valid_
+
+opm/simulators/linalg/NeuralCprPolicy.cpp
+  Purpose: Implementation of NeuralCprPolicy.
+  Key functions:
+    NeuralCprPolicy() — loads model via NNModel::loadModel(), catches and
+      logs failures, sets valid_ = false for graceful fallback
+    predict() — calls feat.toArray(), runs NNModel::apply(), decodes argmax
+      to CprPolicyAction; computes numerically-stable softmax for confidence
+    decodeLogits() — maps flat index i to (dec, cprw, fine, coarse) and
+      constructs CprPolicyAction
+    ruleBasedPredict() — deterministic heuristic:
+        nl_iteration == 0       → QuasiIMPES + ParOverILU0
+        slowConv || manyIter    → TrueIMPES  + DILU
+        otherwise               → QuasiIMPES + DILU
+    configToPropertyTree() — builds complete bicgstab+cprw+AMG ptree
+    updatePropertyTreeInPlace() — patches weight_type, finesmoother.type,
+      and/or coarsesolver.preconditioner.smoother individually
+
+
+MODIFIED FILES — C++
+--------------------
+
+opm/simulators/linalg/ISTLSolver.hpp
+  All additions are inside the existing ISTLSolverEbos template class.
+  No public API changes. No changes to FlexibleSolver, AMG, or DILU.
+
+  New private members (added near bottom of class):
+    std::unique_ptr<NeuralCprPolicy> neural_policy_
+    float           confidence_threshold_  (default 0.6)
+    CprPolicyAction last_policy_cfg_
+    bool            policy_cfg_valid_      (false until first prediction)
+    bool            last_solve_failed_
+    double          prev_dt_               (seconds, for dt_ratio)
+    double          prev_residual_norm_    (for nl_residual_reduce)
+    std::unique_ptr<std::ofstream> sweep_log_
+    CprPolicyFeatures last_feat_
+    int             last_episode_idx_
+
+  New private methods:
+    initNeuralPolicy()
+      Called once during solver initialisation.
+      Reads OPM_NEURAL_CPR_WEIGHTS → constructs NeuralCprPolicy.
+      Reads OPM_NEURAL_CPR_CONFIDENCE → sets confidence_threshold_.
+      Reads OPM_CPR_SWEEP_LOG → opens CSV file and writes header row.
+      Logs loaded/fallback status via OpmLog.
+
+    extractFeatures(M)
+      Builds a CprPolicyFeatures from the current simulator state and
+      the block matrix M. Computes nnz_per_row from M.N() and M.nonzeroes().
+      Computes diag_dominance by iterating block rows and accumulating
+      Frobenius norms of diagonal vs. off-diagonal blocks.
+
+    applyNeuralPolicy(M)
+      Called inside prepare() on every Newton step.
+      Three-tier optimisation:
+        Tier 1: return early if shouldCreateSolver() is false
+        Tier 2: return early if predicted config == last_policy_cfg_
+        Tier 3: call updatePropertyTreeInPlace() if use_cprw unchanged;
+                else destroy FlexibleSolver object and call configToPropertyTree()
+      Enforces confidence gate and failure-revert logic.
+      Logs config via OpmLog::debug (visible in .DBG file).
+      Updates prev_dt_ and prev_residual_norm_ after each prediction.
+
+    policyLogStr(act)
+      Formats a one-line debug string: "cprw weight=X fine=Y coarse=Z"
+
+  Modified method prepare():
+    If sweep_log_ is open: call extractFeatures(), store in last_feat_,
+      write feature row to CSV after the linear solve completes.
+    If neural_policy_ is set: call applyNeuralPolicy(M) before solver build.
+    After each solve: record prev_linsolver_iters, last_solve_failed_,
+      update prev_dt_ and prev_residual_norm_.
+
+CMakeLists_files.cmake
+  Added to the opm-simulators library source list:
+    opm/simulators/linalg/NeuralCprPolicy.cpp
+    opm/simulators/linalg/CprPolicyAction.hpp
+    opm/simulators/linalg/CprPolicyFeatures.hpp
+    opm/simulators/linalg/NeuralCprPolicy.hpp
+
+
+NEW FILES — doc/neural_cpr/ (tooling and model)
+------------------------------------------------
+
+doc/neural_cpr/run_sweep.py
+  Generates all 24 JSON solver configs and runs flow in parallel.
+  Usage: python run_sweep.py --flow /path/to/flow --decks A.DATA B.DATA --out /tmp/sweep
+  Output: <out>/configs/label_NN.json, <out>/<deck_stem>_NN.csv
+  Key design: each flow process gets OPM_CPR_SWEEP_LOG set to a unique CSV path;
+    --cpr-reuse-setup=0 forces preconditioner rebuild every step so timing
+    reflects the true cost of each config.
+
+doc/neural_cpr/collect_sweep_labels.py
+  Joins per-config CSVs into a single training_data.csv.
+  Key: (deck, episode, newton_iter) — deck prefix prevents cross-model
+    collision when multiple reservoir cases share episode/newton numbering.
+  Label: config with median fastest total_ms across repeated runs.
+  Usage: python collect_sweep_labels.py --csvs /tmp/sweep/*.csv --out training_data.csv
+
+doc/neural_cpr/train_cpr_policy.py
+  Pure-NumPy MLP trainer and Kerasify exporter.
+  Architecture: 14→H→24, default H=32, activation=relu.
+  Optimiser: AdamW with cosine LR decay and early stopping (patience=40).
+  Exports in OPM Kerasify binary format (struct layout matching ml_model.hpp).
+  Key CLI flags: --hidden, --activation, --class-weights, --weight-cap, --out.
+  normalise() mirrors CprPolicyFeatures::toArray() exactly — must be kept in sync.
+
+doc/neural_cpr/cpr_policy.model  (= cpr_policy_v3_2decks.model)
+  Active model for this branch.
+  Format: OPM Kerasify binary, float32.
+  Architecture: 14→32→24, ReLU hidden, linear output.
+  Training: SPE9 + NORNE_ATW2013, 1326 Newton steps, val_acc = 45.5%.
+  Performance: SPE9 −5%, Norne −5.5% wall time vs. rule-based baseline.
+
+doc/neural_cpr/cpr_policy_v3_2decks.model
+  Saved checkpoint identical to cpr_policy.model. Kept for reference.
+
+doc/neural_cpr/cpr_policy_v5_6decks.model
+  Alternative model trained on 6 decks (2762 samples), val_acc = 37%.
+  Not active in this branch; use neural-cpr-v5 branch.
+
+doc/neural_cpr/cpr_policy_v6_tanh24.model
+  Experimental model: 14→24→24 tanh, no class weights, val_acc = 37%.
+  Not active; kept for reference.
+
+doc/neural_cpr/README.md
+  Overview of the neural CPR policy: motivation, quick-start, env vars.
+
+doc/neural_cpr/NeuralCPRPolicy.md
+  Design notes on NeuralCprPolicy: action space, inference path, fallbacks.
+
+doc/neural_cpr/NeuralCPRFeatures.md
+  Description of each of the 14 features and their normalisation.
+
+doc/neural_cpr/ISTLSolver_integration.md
+  How applyNeuralPolicy() hooks into ISTLSolver::prepare(): the three-tier
+  optimisation, sweep-logging path, and env-var interface.
+
+
+Runtime environment variables
+------------------------------
+  OPM_NEURAL_CPR_WEIGHTS    Path to model file. Unset → rule-based fallback.
+  OPM_NEURAL_CPR_CONFIDENCE Softmax confidence threshold (default: 0.6).
+                             Config switch suppressed when top-label prob < threshold.
+  OPM_CPR_SWEEP_LOG         Path for per-Newton-step feature CSV (data collection only).
