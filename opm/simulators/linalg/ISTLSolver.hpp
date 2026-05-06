@@ -418,10 +418,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                            "dt_days,dt_ratio,nl_residual_norm,nl_residual_reduce,"
                            "nl_iteration,nnz_per_row,diag_dominance,"
                            "prev_linsolver_iters,prev_solve_failed,"
-                           "time_elapsed_frac,num_cells_log,block_size,"
-                           "well_density,nl_residual_trend,"
-                           "num_phases,dt_cut_count,prev2_linsolver_iters,"
-                           "condition_number_estimate,bhp_well_fraction\n";
+                           "time_elapsed_frac,num_cells_log,block_size\n";
+                           // "well_density,nl_residual_trend,"
+                           // "num_phases,dt_cut_count,prev2_linsolver_iters,"
+                           // "condition_number_estimate,bhp_well_fraction\n";
                 }
                 OpmLog::info("NeuralCprPolicy: sweep logging to "
                              + std::string(log_path));
@@ -456,16 +456,16 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 << last_feat_.diag_dominance       << ","
                 << last_feat_.prev_linsolver_iters << ","
                 << last_feat_.prev_solve_failed    << ","
-                << last_feat_.time_elapsed_frac          << ","
-                << last_feat_.num_cells_log              << ","
-                << last_feat_.block_size                 << ","
-                << last_feat_.well_density               << ","
-                << last_feat_.nl_residual_trend          << ","
-                << last_feat_.num_phases                 << ","
-                << last_feat_.dt_cut_count               << ","
-                << last_feat_.prev2_linsolver_iters      << ","
-                << last_feat_.condition_number_estimate  << ","
-                << last_feat_.bhp_well_fraction          << "\n";
+                << last_feat_.time_elapsed_frac    << ","
+                << last_feat_.num_cells_log        << ","
+                << last_feat_.block_size           << "\n";
+                // << last_feat_.well_density               << ","
+                // << last_feat_.nl_residual_trend          << ","
+                // << last_feat_.num_phases                 << ","
+                // << last_feat_.dt_cut_count               << ","
+                // << last_feat_.prev2_linsolver_iters      << ","
+                // << last_feat_.condition_number_estimate  << ","
+                // << last_feat_.bhp_well_fraction          << "\n";
             sweep_log_->flush();
         }
 
