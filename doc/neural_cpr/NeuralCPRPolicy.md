@@ -1,6 +1,6 @@
 # Module: NeuralCPRPolicy
 
-**File:** `opm/simulators/linalg/NeuralCPRPolicy.hpp`
+**File:** `opm/simulators/linalg/NeuralCprPolicy.hpp`
 
 ---
 

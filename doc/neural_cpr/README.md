@@ -53,8 +53,8 @@ other part of the simulation pipeline are required.
 
 | File | Role |
 |---|---|
-| `opm/simulators/linalg/NeuralCPRFeatures.hpp` | Feature struct + normalisation |
-| `opm/simulators/linalg/NeuralCPRPolicy.hpp` | MLP, rule-based fallback, PropertyTree builder |
+| `opm/simulators/linalg/NeuralCprFeatures.hpp` | Feature struct + normalisation |
+| `opm/simulators/linalg/NeuralCprPolicy.hpp` | MLP, rule-based fallback, PropertyTree builder |
 | `opm/simulators/linalg/ISTLSolver.hpp` | Integration hook + caching |
 | `CMakeLists_files.cmake` | Header registration |
 

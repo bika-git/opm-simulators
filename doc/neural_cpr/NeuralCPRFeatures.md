@@ -1,6 +1,6 @@
 # Module: NeuralCPRFeatures
 
-**File:** `opm/simulators/linalg/NeuralCPRFeatures.hpp`
+**File:** `opm/simulators/linalg/NeuralCprFeatures.hpp`
 
 ---
 

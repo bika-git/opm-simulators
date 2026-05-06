@@ -36,7 +36,7 @@ opm/simulators/linalg/CprPolicyFeatures.hpp
       block_size           clamp(x / 6.0)
       pad0, pad1           always 0.0 (reserved)
 
-opm/simulators/linalg/NeuralCPRPolicy.hpp
+opm/simulators/linalg/NeuralCprPolicy.hpp
   Purpose: Declaration of the NeuralCprPolicy class.
   Content:
     - Constructor loads a Kerasify model file (path from OPM_NEURAL_CPR_WEIGHTS)

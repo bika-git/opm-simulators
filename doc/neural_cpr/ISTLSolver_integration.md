@@ -212,8 +212,8 @@ bad choice on the retry.
 The two new headers are added to `PUBLIC_HEADER_FILES`:
 
 ```cmake
-opm/simulators/linalg/NeuralCPRFeatures.hpp
-opm/simulators/linalg/NeuralCPRPolicy.hpp
+opm/simulators/linalg/NeuralCprFeatures.hpp
+opm/simulators/linalg/NeuralCprPolicy.hpp
 ```
 
 No new `.cpp` files or `find_package` calls are needed.  `PropertyTree.hpp`
