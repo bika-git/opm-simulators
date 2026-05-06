@@ -22,6 +22,7 @@
 #include <opm/common/OpmLog/OpmLog.hpp>
 
 #include <algorithm>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -30,6 +31,49 @@ namespace Opm {
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
+
+// Binary model layout (export_binary_fallback in train_cpr_policy.py):
+//   [num_layers : uint32]
+//   [layer_type : uint32]  (3 = Dense)
+//   [weights_rows : uint32]  ← input feature count
+//   ...
+// We read up to the first Dense layer and return weights_rows.
+int NeuralCprPolicy::readModelInputSize(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open())
+        return CprPolicyFeatures::kNumFeatures;
+
+    auto readU32 = [&](unsigned int& v) {
+        f.read(reinterpret_cast<char*>(&v), 4);
+        return !f.fail();
+    };
+
+    unsigned int num_layers = 0;
+    if (!readU32(num_layers) || num_layers == 0)
+        return CprPolicyFeatures::kNumFeatures;
+
+    // Scan layers until we hit the first Dense (type=3).
+    // Activation layers (type=4) contain only 1 uint32; skip them.
+    for (unsigned int i = 0; i < num_layers; ++i) {
+        unsigned int layer_type = 0;
+        if (!readU32(layer_type))
+            break;
+        if (layer_type == 3) {  // kDense
+            unsigned int weights_rows = 0;
+            if (readU32(weights_rows) && weights_rows > 0)
+                return static_cast<int>(weights_rows);
+            break;
+        }
+        if (layer_type == 4) {  // kActivation — skip its 1 uint32
+            unsigned int dummy = 0;
+            readU32(dummy);
+        }
+        // Scaling/UnScaling layers are not used by our models; stop scanning.
+        else break;
+    }
+    return CprPolicyFeatures::kNumFeatures;
+}
 
 NeuralCprPolicy::NeuralCprPolicy(const std::string& model_path)
 {
@@ -44,6 +88,23 @@ NeuralCprPolicy::NeuralCprPolicy(const std::string& model_path)
                         + model_path + "': " + std::string(e.what())
                         + " — using rule-based fallback");
         valid_ = false;
+        return;
+    }
+
+    if (valid_) {
+        model_input_size_ = readModelInputSize(model_path);
+        const int nf = CprPolicyFeatures::kNumFeatures;
+        OpmLog::info("NeuralCprPolicy: loaded model from " + model_path
+                     + " (input=" + std::to_string(model_input_size_)
+                     + "/" + std::to_string(nf) + " features"
+                     + (model_input_size_ < nf ? ", older model — trailing features zeroed" : "")
+                     + ")");
+        if (model_input_size_ > nf) {
+            OpmLog::warning("NeuralCprPolicy: model expects " + std::to_string(model_input_size_)
+                            + " features but binary only provides " + std::to_string(nf)
+                            + " — using rule-based fallback");
+            valid_ = false;
+        }
     }
 }
 
@@ -60,8 +121,8 @@ CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
     }
 
     auto arr = feat.toArray();
-    Opm::ML::Tensor<float> in(CprPolicyFeatures::kNumFeatures);
-    for (int i = 0; i < CprPolicyFeatures::kNumFeatures; ++i)
+    Opm::ML::Tensor<float> in(model_input_size_);
+    for (int i = 0; i < model_input_size_; ++i)
         in(i) = arr[i];
 
     Opm::ML::Tensor<float> out;
@@ -70,15 +131,27 @@ CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
         return ruleBasedPredict(feat);
     }
 
+    // Apply forbidden mask: set disallowed logits to -inf so they are never
+    // selected by argmax or included in the softmax normalisation sum.
+    if (forbidden_mask_) {
+        for (int i = 0; i < 24; ++i) {
+            if (forbidden_mask_ & (1u << i))
+                out.data_[i] = -std::numeric_limits<float>::infinity();
+        }
+    }
+
     if (out_confidence) {
-        // Softmax over 24 logits, numerically stable.
-        const auto* d  = out.data_.data();
-        float max_l    = *std::max_element(d, d + 24);
-        float sum      = 0.f;
-        for (int i = 0; i < 24; ++i) sum += std::exp(d[i] - max_l);
+        // Softmax over allowed logits only, numerically stable.
+        const auto* d = out.data_.data();
+        float max_l = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < 24; ++i)
+            if (std::isfinite(d[i])) max_l = std::max(max_l, d[i]);
+        float sum = 0.f;
+        for (int i = 0; i < 24; ++i)
+            if (std::isfinite(d[i])) sum += std::exp(d[i] - max_l);
         const int best = static_cast<int>(
             std::max_element(d, d + 24) - d);
-        *out_confidence = std::exp(d[best] - max_l) / sum;
+        *out_confidence = (sum > 0.f) ? std::exp(d[best] - max_l) / sum : 1.0f;
     }
 
     return decodeLogits(out.data_);
@@ -88,6 +161,7 @@ CprPolicyAction NeuralCprPolicy::decodeLogits(const std::vector<float>& logits)
 {
     // Joint 3×2×2×2 = 24-way output.
     // Index i encodes: dec = i/8, cprw = (i/4)%2, fine = (i/2)%2, coarse = i%2
+    // Forbidden labels have been set to -inf before this call.
     const auto best = std::max_element(logits.begin(), logits.begin() + 24);
     const int  idx  = static_cast<int>(std::distance(logits.begin(), best));
 

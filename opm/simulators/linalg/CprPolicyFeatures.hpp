@@ -44,12 +44,18 @@ struct CprPolicyFeatures {
     double prev_linsolver_iters = 0.0;  ///< Krylov iterations in the previous solve
     double prev_solve_failed    = 0.0;  ///< 1.0 if the previous linear solve failed
     double time_elapsed_frac    = 0.0;  ///< simulator.time() / simulator.endTime()
-    double num_cells_log        = 3.0;  ///< log10(number of grid cells)
-    double block_size           = 3.0;  ///< number of equations per cell (numEq)
-    double pad0                 = 0.0;  ///< reserved for future use
-    double pad1                 = 0.0;  ///< reserved for future use
+    double num_cells_log            = 3.0;  ///< log10(number of grid cells)
+    double block_size               = 3.0;  ///< number of equations per cell (numEq)
+    double well_density             = 0.0;  ///< num_wells / num_cells (coupling intensity)
+    double nl_residual_trend        = 1.0;  ///< prev_norm / prev2_norm (>1=diverging)
+    // Medium-impact features
+    double num_phases               = 3.0;  ///< active phases: 1, 2, or 3
+    double dt_cut_count             = 0.0;  ///< consecutive timestep cuts (resets on success)
+    double prev2_linsolver_iters    = 0.0;  ///< Krylov iterations two solves ago (trend signal)
+    double condition_number_estimate= 1.0;  ///< max_diag / min_diag over sampled rows
+    double bhp_well_fraction        = 0.0;  ///< fraction of wells currently on BHP control
 
-    static constexpr int kNumFeatures = 14;
+    static constexpr int kNumFeatures = 19;
 
     /// Return all features normalised to approximately [0, 1].
     std::array<float, kNumFeatures> toArray() const
@@ -58,6 +64,7 @@ struct CprPolicyFeatures {
             return static_cast<float>(std::clamp(v, 0.0, 1.0));
         };
         return {{
+            // original 12
             static_cast<float>(std::log1p(dt_days) / 7.0),
             c01(dt_ratio / 10.0),
             static_cast<float>((std::log10(std::max(nl_residual_norm, 1e-14)) + 14.0) / 14.0),
@@ -70,8 +77,18 @@ struct CprPolicyFeatures {
             c01(time_elapsed_frac),
             c01(num_cells_log / 6.0),
             c01(block_size / 6.0),
-            static_cast<float>(pad0),
-            static_cast<float>(pad1)
+            // highest-impact new (sweep5)
+            c01(well_density * 200.0),                       // 0.5% density → 1.0
+            static_cast<float>(                              // log: 0.01→0, 1→0.5, 100→1
+                (std::log10(std::clamp(nl_residual_trend, 0.01, 100.0)) + 2.0) / 4.0),
+            // medium-impact new
+            c01(num_phases / 3.0),                           // 1/2/3 → 0.33/0.67/1.0
+            c01(dt_cut_count / 5.0),                         // 5 cuts → 1.0
+            c01(prev2_linsolver_iters / 50.0),               // same scale as prev_linsolver_iters
+            static_cast<float>(                              // log: 1→0, 1e5→0.5, 1e10→1
+                std::clamp(std::log10(std::max(condition_number_estimate, 1.0)) / 10.0,
+                           0.0, 1.0)),
+            c01(bhp_well_fraction)                           // already [0,1]
         }};
     }
 };

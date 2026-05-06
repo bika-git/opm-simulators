@@ -56,7 +56,17 @@ FEATURE_COLS = [
     "nl_iteration", "nnz_per_row", "diag_dominance",
     "prev_linsolver_iters", "prev_solve_failed",
     "time_elapsed_frac", "num_cells_log", "block_size",
+    "well_density", "nl_residual_trend",         # added in sweep5
+    "num_phases", "dt_cut_count", "prev2_linsolver_iters",
+    "condition_number_estimate", "bhp_well_fraction",  # added in sweep6+
 ]
+
+# Columns absent in older CSV files — fall back to "0".
+OPTIONAL_FEATURE_COLS = {
+    "well_density", "nl_residual_trend",
+    "num_phases", "dt_cut_count", "prev2_linsolver_iters",
+    "condition_number_estimate", "bhp_well_fraction",
+}
 
 
 def main():
@@ -69,6 +79,18 @@ def main():
     parser.add_argument("--min-configs", type=int, default=2,
                         help="Minimum configs per sample to keep (default: 2)")
     args = parser.parse_args()
+
+    # Detect which feature columns are actually present across all input files.
+    # Only emit columns that appear in at least one input CSV so that older
+    # sweeps (fewer features) don't produce zero-padded trailing columns that
+    # confuse the model.
+    present_cols: set[str] = set()
+    for path in args.csvs:
+        with open(path, newline="") as fh:
+            present_cols.update(csv.DictReader(fh).fieldnames or [])
+    active_feature_cols = [c for c in FEATURE_COLS if c in present_cols]
+    print(f"Feature columns detected: {len(active_feature_cols)} "
+          f"({', '.join(active_feature_cols)})")
 
     # key → {config: [total_ms, ...], features: row_dict}
     samples: dict[tuple, dict] = defaultdict(lambda: {"times": {}, "feat": None})
@@ -95,7 +117,10 @@ def main():
                 entry["times"][config].append(ms)
 
                 if entry["feat"] is None:
-                    entry["feat"] = {c: row[c] for c in FEATURE_COLS}
+                    entry["feat"] = {
+                        c: row.get(c, "0") if c in OPTIONAL_FEATURE_COLS else row[c]
+                        for c in active_feature_cols
+                    }
                     entry["feat"]["deck"] = deck
 
     print(f"Read {total_rows} rows from {len(args.csvs)} files.")
@@ -134,7 +159,7 @@ def main():
     for label, count in dist.most_common(10):
         print(f"  label {label:2d}: {count:5d} samples")
 
-    fieldnames = ["deck"] + FEATURE_COLS + ["best_config", "label"]
+    fieldnames = ["deck"] + active_feature_cols + ["best_config", "label"]
     with open(args.out, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()

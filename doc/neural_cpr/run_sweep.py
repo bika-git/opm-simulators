@@ -132,7 +132,7 @@ def write_configs(config_dir: Path) -> dict[int, Path]:
 # Running flow
 # ---------------------------------------------------------------------------
 
-def run_one(flow: str, deck: str, cfg: dict, json_path: Path,
+def run_one(flow_cmd: list[str], deck: str, cfg: dict, json_path: Path,
             out_dir: Path, csv_path: Path) -> tuple[int, bool, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     log = out_dir / "flow.log"
@@ -140,7 +140,7 @@ def run_one(flow: str, deck: str, cfg: dict, json_path: Path,
     env["OPM_CPR_SWEEP_LOG"] = str(csv_path)
 
     cmd = [
-        flow,
+        *flow_cmd,
         f"--linear-solver={json_path}",
         "--cpr-reuse-setup=0",
         f"--output-dir={out_dir}",
@@ -159,18 +159,31 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--flow",    required=True, help="Path to flow executable")
+    parser.add_argument("--nprocs",  type=int, default=1,
+                        help="MPI ranks per flow run via mpirun (default: 1 = serial)")
     parser.add_argument("--decks",   nargs="+", required=True,
                         help="Reservoir deck files to sweep (.DATA)")
     parser.add_argument("--out",     default="/tmp/sweep2",
                         help="Output directory (default: /tmp/sweep2)")
-    parser.add_argument("--jobs",    type=int, default=os.cpu_count() or 4,
-                        help="Max parallel flow processes (default: nCPU)")
+    parser.add_argument("--jobs",    type=int, default=None,
+                        help="Max parallel flow processes (default: nCPU / nprocs)")
     parser.add_argument("--labels",  nargs="*", type=int,
                         help="Subset of labels 0-23 to run (default: all 24)")
     args = parser.parse_args()
 
     out_dir    = Path(args.out)
     config_dir = out_dir / "configs"
+
+    # Build the flow command: prepend mpirun when --nprocs > 1.
+    if args.nprocs > 1:
+        flow_cmd = ["mpirun", "-np", str(args.nprocs),
+                    "--bind-to", "none", "--mca", "btl", "self,sm",
+                    args.flow]
+    else:
+        flow_cmd = [args.flow]
+
+    # Default parallelism: don't over-subscribe — each MPI job uses nprocs cores.
+    max_jobs = args.jobs or max(1, (os.cpu_count() or 4) // args.nprocs)
 
     configs = ALL_CONFIGS
     if args.labels:
@@ -189,13 +202,13 @@ def main():
             tasks.append((deck, cfg, json_paths[label], run_out, csv_path))
 
     print(f"Launching {len(tasks)} runs across {len(args.decks)} deck(s), "
-          f"≤{args.jobs} in parallel ...")
+          f"≤{max_jobs} in parallel (nprocs={args.nprocs}) ...")
 
     ok = 0
     fail = 0
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+    with ThreadPoolExecutor(max_workers=max_jobs) as pool:
         futures = {
-            pool.submit(run_one, args.flow, deck, cfg, jp, rod, csv): (deck, cfg)
+            pool.submit(run_one, flow_cmd, deck, cfg, jp, rod, csv): (deck, cfg)
             for deck, cfg, jp, rod, csv in tasks
         }
         for fut in as_completed(futures):

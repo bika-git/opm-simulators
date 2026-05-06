@@ -59,9 +59,19 @@ public:
 
     bool isLoaded() const { return valid_; }
 
+    /// Forbid a label index (0–23) from ever being selected by predict().
+    /// When the model's top logit falls on a forbidden label, the next highest
+    /// non-forbidden label is returned instead.  Safe to call multiple times.
+    void forbidLabel(int label)
+    {
+        if (label >= 0 && label < 24)
+            forbidden_mask_ |= (1u << label);
+    }
+
     /// Predict the best CPR configuration for the given features.
     /// If \p out_confidence is non-null it receives the softmax probability of
     /// the top label (0–1).  Rule-based mode always writes 1.0.
+    /// Forbidden labels (see forbidLabel()) are never returned.
     CprPolicyAction predict(const CprPolicyFeatures& feat,
                             float* out_confidence = nullptr) const;
 
@@ -83,7 +93,13 @@ public:
 
 private:
     mutable Opm::ML::NNModel<float> model_;
-    bool valid_ = false;
+    bool     valid_            = false;
+    int      model_input_size_ = CprPolicyFeatures::kNumFeatures;
+    uint32_t forbidden_mask_   = 0;  ///< bitmask of labels never to select
+
+    /// Read the input feature count from the first Dense layer of a binary model file.
+    /// Returns CprPolicyFeatures::kNumFeatures on any parse failure.
+    static int readModelInputSize(const std::string& path);
 
     static CprPolicyAction ruleBasedPredict(const CprPolicyFeatures& feat);
     static CprPolicyAction decodeLogits(const std::vector<float>& logits);

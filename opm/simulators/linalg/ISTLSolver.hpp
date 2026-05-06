@@ -52,6 +52,7 @@
 #include <opm/simulators/linalg/AbstractISTLSolver.hpp>
 #include <opm/simulators/linalg/printlinearsolverparameter.hpp>
 #include <opm/simulators/linalg/CprPolicyAction.hpp>
+#include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/simulators/linalg/CprPolicyFeatures.hpp>
 #include <opm/simulators/linalg/NeuralCprPolicy.hpp>
 
@@ -164,6 +165,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         using Indices = GetPropType<TypeTag, Properties::Indices>;
         using WellModel = GetPropType<TypeTag, Properties::WellModel>;
         using Simulator = GetPropType<TypeTag, Properties::Simulator>;
+        using FluidSystem = GetPropType<TypeTag, Properties::FluidSystem>;
         using Matrix = typename SparseMatrixAdapter::IstlMatrix;
         using ThreadManager = GetPropType<TypeTag, Properties::ThreadManager>;
         using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
@@ -363,6 +365,39 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             const char* thr_env = std::getenv("OPM_NEURAL_CPR_CONFIDENCE");
             confidence_threshold_ = thr_env ? std::stof(thr_env) : 0.6f;
 
+            // OPM_NEURAL_CPR_FORBID_LABELS=a,b,c — comma-separated list of
+            // label indices (0-23) to exclude from selection.  The policy picks
+            // the next highest-scoring allowed label instead.
+            // Example: "16,17,18,19,20,21,22,23" blocks all trueimpesanalytic
+            // configs for decks where that weight type is unsupported.
+            {
+                const char* forbid_env = std::getenv("OPM_NEURAL_CPR_FORBID_LABELS");
+                if (forbid_env) {
+                    std::string s(forbid_env);
+                    std::string token;
+                    std::vector<int> forbidden;
+                    for (char c : s + ",") {
+                        if (c == ',') {
+                            if (!token.empty()) {
+                                try { forbidden.push_back(std::stoi(token)); }
+                                catch (...) {}
+                                token.clear();
+                            }
+                        } else {
+                            token += c;
+                        }
+                    }
+                    for (int lbl : forbidden)
+                        neural_policy_->forbidLabel(lbl);
+                    if (rank0 && !forbidden.empty()) {
+                        std::string msg = "NeuralCprPolicy: forbidden labels:";
+                        for (int lbl : forbidden) msg += " " + std::to_string(lbl);
+                        msg += " — will select next best allowed label";
+                        OpmLog::info(msg);
+                    }
+                }
+            }
+
             if (rank0) {
                 if (neural_policy_->isLoaded())
                     OpmLog::info("NeuralCprPolicy: loaded model from "
@@ -383,7 +418,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                            "dt_days,dt_ratio,nl_residual_norm,nl_residual_reduce,"
                            "nl_iteration,nnz_per_row,diag_dominance,"
                            "prev_linsolver_iters,prev_solve_failed,"
-                           "time_elapsed_frac,num_cells_log,block_size\n";
+                           "time_elapsed_frac,num_cells_log,block_size,"
+                           "well_density,nl_residual_trend,"
+                           "num_phases,dt_cut_count,prev2_linsolver_iters,"
+                           "condition_number_estimate,bhp_well_fraction\n";
                 }
                 OpmLog::info("NeuralCprPolicy: sweep logging to "
                              + std::string(log_path));
@@ -418,9 +456,16 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 << last_feat_.diag_dominance       << ","
                 << last_feat_.prev_linsolver_iters << ","
                 << last_feat_.prev_solve_failed    << ","
-                << last_feat_.time_elapsed_frac    << ","
-                << last_feat_.num_cells_log        << ","
-                << last_feat_.block_size           << "\n";
+                << last_feat_.time_elapsed_frac          << ","
+                << last_feat_.num_cells_log              << ","
+                << last_feat_.block_size                 << ","
+                << last_feat_.well_density               << ","
+                << last_feat_.nl_residual_trend          << ","
+                << last_feat_.num_phases                 << ","
+                << last_feat_.dt_cut_count               << ","
+                << last_feat_.prev2_linsolver_iters      << ","
+                << last_feat_.condition_number_estimate  << ","
+                << last_feat_.bhp_well_fraction          << "\n";
             sweep_log_->flush();
         }
 
@@ -433,10 +478,16 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         {
             CprPolicyFeatures feat;
 
+            const auto& gcomm = simulator_.gridView().comm();
+
             const double dt_s     = simulator_.timeStepSize();
             feat.dt_days          = dt_s / 86400.0;
             feat.dt_ratio         = (prev_dt_ > 0.0) ? dt_s / prev_dt_ : 1.0;
-            feat.nl_residual_norm = rhs_->two_norm();
+
+            // Use the global residual norm so the feature value matches what the
+            // sweep (always serial, single-process) recorded during training.
+            // In serial gcomm.sum() is a no-op; in parallel it does AllReduce.
+            feat.nl_residual_norm = std::sqrt(gcomm.sum(rhs_->two_norm2()));
             feat.nl_residual_reduce = (prev_residual_norm_ > 0.0)
                                      ? feat.nl_residual_norm / prev_residual_norm_
                                      : 1.0;
@@ -463,10 +514,76 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             feat.time_elapsed_frac = (endT > 0.0)
                 ? std::clamp(simulator_.time() / endT, 0.0, 1.0) : 0.0;
 
-            feat.num_cells_log = (M.N() > 0)
-                ? std::log10(static_cast<double>(M.N())) : 1.0;
+            // Global cell count so num_cells_log matches the serial-sweep value.
+            {
+                const auto global_N = gcomm.sum(static_cast<std::size_t>(M.N()));
+                feat.num_cells_log = (global_N > 0)
+                    ? std::log10(static_cast<double>(global_N)) : 1.0;
+            }
 
             feat.block_size = static_cast<double>(Matrix::block_type::rows);
+
+            // well_density: global wells / global cells.
+            if (feat.nl_iteration == 0.0) {
+                const auto local_wells = static_cast<std::size_t>(
+                    simulator_.problem().wellModel().numLocalWells());
+                const auto global_wells = gcomm.sum(local_wells);
+                const auto global_cells = gcomm.sum(static_cast<std::size_t>(M.N()));
+                cached_num_wells_ = static_cast<double>(global_wells);
+                cached_global_cells_ = static_cast<double>(global_cells);
+            }
+            feat.well_density = (cached_global_cells_ > 0.0)
+                ? cached_num_wells_ / cached_global_cells_ : 0.0;
+
+            // nl_residual_trend: ratio of the previous two residual norms.
+            feat.nl_residual_trend = (prev2_residual_norm_ > 0.0 && prev_residual_norm_ > 0.0)
+                ? prev_residual_norm_ / prev2_residual_norm_
+                : 1.0;
+
+            // num_phases: count of active fluid phases (1/2/3).
+            {
+                int np = 0;
+                if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) ++np;
+                if (FluidSystem::phaseIsActive(FluidSystem::oilPhaseIdx))   ++np;
+                if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx))   ++np;
+                feat.num_phases = static_cast<double>(np);
+            }
+
+            // dt_cut_count: consecutive timestep cuts (detected on Newton iter 0).
+            // A cut is signalled by dt_ratio < 0.99 at the start of a new timestep.
+            if (feat.nl_iteration == 0.0) {
+                if (prev_dt_ > 0.0 && feat.dt_ratio < 0.99)
+                    dt_cut_count_++;
+                else
+                    dt_cut_count_ = 0;
+            }
+            feat.dt_cut_count = static_cast<double>(dt_cut_count_);
+
+            // prev2_linsolver_iters: Krylov iterations two solves ago (trend signal).
+            feat.prev2_linsolver_iters = static_cast<double>(prev2_linsolver_iters_);
+
+            // condition_number_estimate: max/min diagonal block norm over sampled rows.
+            if (feat.nl_iteration == 0.0)
+                cached_condition_number_ = computeConditionEstimate(M);
+            feat.condition_number_estimate = cached_condition_number_;
+
+            // bhp_well_fraction: global fraction of wells on BHP control.
+            if (feat.nl_iteration == 0.0) {
+                const auto& ws = simulator_.problem().wellModel().wellState();
+                const int nw = static_cast<int>(ws.numWells());
+                int bhp_count = 0;
+                for (int w = 0; w < nw; ++w) {
+                    const auto& s = ws.well(w);
+                    if (s.production_cmode == WellProducerCMode::BHP ||
+                        s.injection_cmode  == WellInjectorCMode::BHP)
+                        ++bhp_count;
+                }
+                const int global_nw  = gcomm.sum(nw);
+                const int global_bhp = gcomm.sum(bhp_count);
+                cached_bhp_well_fraction_ = (global_nw > 0)
+                    ? double(global_bhp) / double(global_nw) : 0.0;
+            }
+            feat.bhp_well_fraction = cached_bhp_well_fraction_;
 
             return feat;
         }
@@ -488,6 +605,24 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 if (offN > 0.0) { sumRatio += diagN / offN; ++count; }
             }
             return (count > 0) ? sumRatio / double(count) : 1.0;
+        }
+
+        /// Cheap condition-number proxy: max/min diagonal block norm over sampled rows.
+        static double computeConditionEstimate(const Matrix& M)
+        {
+            const std::size_t nSample = std::min(M.N(), std::size_t(200));
+            double maxD = 0.0, minD = std::numeric_limits<double>::max();
+            for (std::size_t i = 0; i < nSample; ++i) {
+                const auto& row = M[i];
+                for (auto it = row.begin(); it != row.end(); ++it) {
+                    if (it.index() == i) {
+                        const double fn = it->frobenius_norm();
+                        maxD = std::max(maxD, fn);
+                        minD = std::min(minD, fn);
+                    }
+                }
+            }
+            return (minD > 0.0) ? maxD / minD : 1.0;
         }
 
         /// Run the neural policy and update prm_ for the upcoming solver build.
@@ -514,14 +649,54 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             if (last_solve_failed_)
                 cfg = CprPolicyAction{};
 
-            // Below confidence threshold: keep the existing config to avoid
-            // rebuilds triggered by uncertain predictions.  On the very first
-            // call (no current config) we proceed regardless.
-            if (policy_cfg_valid_ && confidence < confidence_threshold_)
-                return;
+            // In a parallel run each MPI rank predicts from its own local matrix
+            // partition, so ranks can independently arrive at different configs.
+            // Rank 0 is authoritative: encode its decision as a label 0-23, or
+            // -1 (below-threshold / keep current config), then broadcast so every
+            // rank applies the same preconditioner structure.  Without this, ranks
+            // build mismatched solver objects and deadlock in AMG / overlap setup.
+            if (isParallel()) {
+                // -1 means "keep current config" (below-threshold case).
+                int label = -1;
+                if (simulator_.gridView().comm().rank() == 0) {
+                    if (!policy_cfg_valid_ || confidence >= confidence_threshold_) {
+                        const int dec    = static_cast<int>(cfg.weight_type);
+                        const int cprw   = cfg.use_cprw ? 1 : 0;
+                        const int fine   = (cfg.fine_smoother   == CprSmoother::DILU) ? 1 : 0;
+                        const int coarse = (cfg.coarse_smoother == CprSmoother::DILU) ? 1 : 0;
+                        label = dec * 8 + cprw * 4 + fine * 2 + coarse;
+                    }
+                }
+                simulator_.gridView().comm().broadcast(&label, 1, 0);
+                if (label < 0)
+                    return;
+                const int d = label / 8, w = (label / 4) % 2,
+                          f = (label / 2) % 2, c = label % 2;
+                switch (d) {
+                case 0:  cfg.weight_type = CprWeightType::QuasiIMPES;         break;
+                case 1:  cfg.weight_type = CprWeightType::TrueIMPES;          break;
+                default: cfg.weight_type = CprWeightType::TrueIMPESAnalytic;  break;
+                }
+                cfg.use_cprw        = (w == 1);
+                cfg.fine_smoother   = (f == 0) ? CprSmoother::ParOverILU0 : CprSmoother::DILU;
+                cfg.coarse_smoother = (c == 0) ? CprSmoother::ILU0        : CprSmoother::DILU;
+            } else {
+                // Serial path: keep existing threshold check.
+                if (policy_cfg_valid_ && confidence < confidence_threshold_)
+                    return;
+            }
+
+            const bool policy_changed = !policy_cfg_valid_ || !(cfg == last_policy_cfg_);
+            if (simulator_.gridView().comm().rank() == 0) {
+                OpmLog::debug("NeuralCprPolicy decision label_"
+                              + std::to_string(policyLabel(cfg))
+                              + " confidence=" + std::to_string(confidence)
+                              + " changed=" + std::string(policy_changed ? "yes" : "no")
+                              + " " + policyLogStr(cfg));
+            }
 
             // Tier 2: config unchanged — nothing to do.
-            if (policy_cfg_valid_ && cfg == last_policy_cfg_)
+            if (!policy_changed)
                 return;
 
             const double tol   = prm_[activeSolverNum_].template
@@ -553,7 +728,8 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             last_policy_cfg_    = cfg;
             policy_cfg_valid_   = true;
             prev_dt_            = simulator_.timeStepSize();
-            prev_residual_norm_ = feat.nl_residual_norm;
+            prev2_residual_norm_ = prev_residual_norm_;   // shift history
+            prev_residual_norm_  = feat.nl_residual_norm;
         }
 
         static std::string policyLogStr(const CprPolicyAction& a)
@@ -562,6 +738,15 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                    + " weight=" + NeuralCprPolicy::weightTypeStr(a.weight_type)
                    + " fine="   + NeuralCprPolicy::fineSmootherStr(a.fine_smoother)
                    + " coarse=" + NeuralCprPolicy::coarseSmootherStr(a.coarse_smoother);
+        }
+
+        static int policyLabel(const CprPolicyAction& a)
+        {
+            const int dec = static_cast<int>(a.weight_type);
+            const int cprw = a.use_cprw ? 1 : 0;
+            const int fine = (a.fine_smoother == CprSmoother::DILU) ? 1 : 0;
+            const int coarse = (a.coarse_smoother == CprSmoother::DILU) ? 1 : 0;
+            return dec * 8 + cprw * 4 + fine * 2 + coarse;
         }
 
         void setActiveSolver(const int num) override
@@ -628,8 +813,9 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                     // Keep prev_* in sync so dt_ratio and nl_residual_reduce are
                     // meaningful on the next Newton step (these are normally updated
                     // in applyNeuralPolicy() which is skipped in sweep mode).
-                    prev_dt_            = simulator_.timeStepSize();
-                    prev_residual_norm_ = last_feat_.nl_residual_norm;
+                    prev_dt_             = simulator_.timeStepSize();
+                    prev2_residual_norm_ = prev_residual_norm_;          // shift history
+                    prev_residual_norm_  = last_feat_.nl_residual_norm;
                     auto t0 = std::chrono::steady_clock::now();
                     prepareFlexibleSolver();
                     last_setup_ms_ = std::chrono::duration<double, std::milli>(
@@ -705,8 +891,9 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 }
             }
 
-            iterations_             = result.iterations;
-            cached_linsolver_iters_ = result.iterations;
+            iterations_              = result.iterations;
+            prev2_linsolver_iters_   = cached_linsolver_iters_;  // shift history
+            cached_linsolver_iters_  = result.iterations;
 
             // Check convergence, iterations etc.
             last_solve_failed_ = !checkConvergence(result);
@@ -983,11 +1170,18 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         CprPolicyAction last_policy_cfg_;               ///< last action written into prm_
         double          prev_dt_              = 0.0;    ///< dt from the previous prepare() call (s)
         double          prev_residual_norm_   = 0.0;    ///< rhs norm from the previous prepare() call
-        int             cached_linsolver_iters_ = 0;    ///< Krylov iterations from last solve()
+        double          prev2_residual_norm_  = 0.0;    ///< rhs norm from two prepare() calls ago
+        int             cached_linsolver_iters_  = 0;  ///< Krylov iterations from last solve()
+        int             prev2_linsolver_iters_   = 0;  ///< Krylov iterations two solves ago
+        int             dt_cut_count_            = 0;  ///< consecutive timestep cuts
 
         // Feature caches (avoid recomputing invariants)
-        mutable double cached_nnz_per_row_    = -1.0;  ///< permanent after first call
-        mutable double cached_diag_dominance_ =  1.0;  ///< refreshed on Newton iter 0
+        mutable double cached_nnz_per_row_         = -1.0;  ///< permanent after first call
+        mutable double cached_diag_dominance_       =  1.0;  ///< refreshed on Newton iter 0
+        mutable double cached_num_wells_            =  0.0;  ///< global well count, refreshed on iter 0
+        mutable double cached_global_cells_         =  0.0;  ///< global cell count, refreshed on iter 0
+        mutable double cached_condition_number_     =  1.0;  ///< refreshed on Newton iter 0
+        mutable double cached_bhp_well_fraction_    =  0.0;  ///< refreshed on Newton iter 0
 
         // Sweep logging (OPM_CPR_SWEEP_LOG)
         std::unique_ptr<std::ofstream> sweep_log_;

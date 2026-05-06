@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Train and export the NeuralCprPolicy MLP.
 
@@ -105,8 +106,20 @@ def normalise(row: dict) -> np.ndarray:
         c01(float(row["time_elapsed_frac"])),
         c01(float(row["num_cells_log"]) / 6.0),
         c01(float(row["block_size"]) / 6.0),
-        0.0,   # pad0
-        0.0,   # pad1
+        # well_density: 0.5% density → 1.0  (0.0 for old CSVs lacking this column)
+        c01(float(row.get("well_density", "0.0")) * 200.0),
+        # nl_residual_trend: log scale 0.01→0, 1→0.5, 100→1
+        float(np.clip(
+            (math.log10(max(float(row.get("nl_residual_trend", "1.0")), 0.01)) + 2.0) / 4.0,
+            0.0, 1.0)),
+        # medium-impact features (0.0 for older CSVs)
+        c01(float(row.get("num_phases", "3")) / 3.0),
+        c01(float(row.get("dt_cut_count", "0")) / 5.0),
+        c01(float(row.get("prev2_linsolver_iters", "0")) / 50.0),
+        float(np.clip(
+            math.log10(max(float(row.get("condition_number_estimate", "1.0")), 1.0)) / 10.0,
+            0.0, 1.0)),
+        c01(float(row.get("bhp_well_fraction", "0.0")))
     ], dtype=np.float32)
 
 
@@ -115,10 +128,11 @@ def normalise(row: dict) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 class MLP:
-    def __init__(self, hidden: int = 32, activation: str = "relu", seed: int = 42):
+    def __init__(self, hidden: int = 32, activation: str = "relu", seed: int = 42,
+                 n_features: int = 19):        # ← dynamic input size
         rng = np.random.default_rng(seed)
         self.activation = activation
-        self.W1 = rng.standard_normal((hidden, 14)).astype(np.float32) * math.sqrt(2 / 14)
+        self.W1 = rng.standard_normal((hidden, n_features)).astype(np.float32) * math.sqrt(2 / n_features)
         self.b1 = np.zeros(hidden, dtype=np.float32)
         self.W2 = rng.standard_normal((24, hidden)).astype(np.float32) * math.sqrt(2 / hidden)
         self.b2 = np.zeros(24, dtype=np.float32)
@@ -216,9 +230,12 @@ def train(features: list[np.ndarray], labels: list[int],
           seed: int          = 42,
           hidden: int        = 32,
           activation: str    = "relu",
-          class_weights: np.ndarray | None = None) -> MLP:
+          class_weights: np.ndarray | None = None,
+          noise_std: float   = 0.0,
+          n_features: int    = 19) -> MLP:
 
-    model = MLP(hidden=hidden, activation=activation, seed=seed)
+    model = MLP(hidden=hidden, activation=activation, seed=seed, n_features=n_features)
+    rng   = np.random.default_rng(seed)          # ← NEW: rng for noise
     n = len(features)
     idx = np.arange(n)
     best_val_loss = float("inf")
@@ -232,7 +249,12 @@ def train(features: list[np.ndarray], labels: list[int],
 
         for i in idx:
             sw = float(class_weights[labels[i]]) if class_weights is not None else 1.0
-            _, cache = model.forward(features[i])
+            # ↓ NEW: add Gaussian noise to features, clip to keep in [0,1]
+            x = features[i]
+            if noise_std > 0.0:
+                x = np.clip(x + rng.normal(0.0, noise_std, size=x.shape).astype(np.float32),
+                            0.0, 1.0)
+            _, cache = model.forward(x)
             loss, grads = model.backward(cache, labels[i], sample_weight=sw)
             model.adam_step(grads, lr)
             total_loss += loss
@@ -359,6 +381,9 @@ def main():
                         help="Weight loss by inverse class frequency")
     parser.add_argument("--weight-cap",   type=float, default=10.0,
                         help="Max class weight relative to mean (default 10)")
+    parser.add_argument("--noise-std",    type=float, default=0.0,   # ← NEW
+                        help="Std of Gaussian noise added to features during training "
+                             "(0 = off, 0.02 recommended)")
     args = parser.parse_args()
 
     print(f"Loading {args.data} ...")
@@ -383,14 +408,19 @@ def main():
               f"max={cw.max():.2f}  effective={int((cw > 0).sum())}/24  "
               f"(cap={args.weight_cap}×mean)")
 
-    arch = f"14→{args.hidden}→24"
+    n_features = len(tr_f[0]) if tr_f else 19
+    arch = f"{n_features}→{args.hidden}→24"
     print(f"Training ({arch}, {args.activation}, AdamW, patience={args.patience}"
-          + (", class-weighted" if cw is not None else "") + ") ...")
+          + (", class-weighted" if cw is not None else "")
+          + (f", noise_std={args.noise_std}" if args.noise_std > 0 else "")
+          + ") ...")
     model = train(tr_f, tr_l, va_f, va_l,
                   epochs=args.epochs, lr_max=args.lr,
                   patience=args.patience, seed=args.seed,
                   hidden=args.hidden, activation=args.activation,
-                  class_weights=cw)
+                  class_weights=cw,
+                  noise_std=args.noise_std,
+                  n_features=n_features)
 
     if args.format == "kerasify":
         export_opm_kerasify(model, args.out)
