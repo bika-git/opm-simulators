@@ -242,6 +242,25 @@ def cosine_lr(epoch: int, total: int, lr_max: float, lr_min: float = 1e-5) -> fl
     return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * epoch / total))
 
 
+def load_pretrained_encoder(model: MLP, npz_path: str) -> int:
+    """Warm-start encoder layers from a pretrain_cpr_policy.py .npz file.
+    Returns the number of layers successfully loaded."""
+    enc = np.load(npz_path)
+    loaded = 0
+    for i in range(model.depth):
+        wk, bk = f"W{i}", f"b{i}"
+        if wk not in enc:
+            break
+        if enc[wk].shape != model.weights[i].shape:
+            print(f"  Warning: pretrained layer {i} shape {enc[wk].shape} "
+                  f"≠ model {model.weights[i].shape} — skipping remaining layers")
+            break
+        model.weights[i][...] = enc[wk]
+        model.biases[i][...]  = enc[bk]
+        loaded += 1
+    return loaded
+
+
 def train(features: list[np.ndarray], labels: list[int],
           val_features: list[np.ndarray] | None = None,
           val_labels:   list[int]        | None = None,
@@ -254,9 +273,15 @@ def train(features: list[np.ndarray], labels: list[int],
           activation: str    = "relu",
           class_weights: np.ndarray | None = None,
           noise_std: float   = 0.0,
-          n_features: int    = 19) -> MLP:
+          n_features: int    = 19,
+          pretrained: str | None = None) -> MLP:
 
     model = MLP(hidden=hidden, depth=depth, activation=activation, seed=seed, n_features=n_features)
+
+    if pretrained:
+        n = load_pretrained_encoder(model, pretrained)
+        model._init_adam()  # reset Adam state after weight loading
+        print(f"  Loaded pretrained encoder: {n}/{depth} layers from {pretrained}")
     rng   = np.random.default_rng(seed)          # ← NEW: rng for noise
     n = len(features)
     idx = np.arange(n)
@@ -406,9 +431,12 @@ def main():
                         help="Weight loss by inverse class frequency")
     parser.add_argument("--weight-cap",   type=float, default=10.0,
                         help="Max class weight relative to mean (default 10)")
-    parser.add_argument("--noise-std",    type=float, default=0.0,   # ← NEW
+    parser.add_argument("--noise-std",    type=float, default=0.0,
                         help="Std of Gaussian noise added to features during training "
                              "(0 = off, 0.02 recommended)")
+    parser.add_argument("--pretrained",   default=None,
+                        help=".npz encoder file from pretrain_cpr_policy.py "
+                             "(warm-starts encoder layers instead of random init)")
     args = parser.parse_args()
 
     print(f"Loading {args.data} ...")
@@ -447,7 +475,8 @@ def main():
                   activation=args.activation,
                   class_weights=cw,
                   noise_std=args.noise_std,
-                  n_features=n_features)
+                  n_features=n_features,
+                  pretrained=args.pretrained)
 
     if args.format == "kerasify":
         export_opm_kerasify(model, args.out)
