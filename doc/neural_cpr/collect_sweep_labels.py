@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Combine per-Newton-step CSV files from the sweep and assign a label
 (best config index) to each (deck, episode, newton_iter) sample.

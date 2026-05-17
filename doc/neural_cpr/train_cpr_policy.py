@@ -124,18 +124,22 @@ def normalise(row: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# MLP  14→H→24
+# MLP  n_features → H×depth → 24  (arbitrary depth)
 # ---------------------------------------------------------------------------
 
 class MLP:
     def __init__(self, hidden: int = 32, activation: str = "relu", seed: int = 42,
-                 n_features: int = 19):        # ← dynamic input size
+                 n_features: int = 19, depth: int = 1):
         rng = np.random.default_rng(seed)
         self.activation = activation
-        self.W1 = rng.standard_normal((hidden, n_features)).astype(np.float32) * math.sqrt(2 / n_features)
-        self.b1 = np.zeros(hidden, dtype=np.float32)
-        self.W2 = rng.standard_normal((24, hidden)).astype(np.float32) * math.sqrt(2 / hidden)
-        self.b2 = np.zeros(24, dtype=np.float32)
+        self.depth = depth
+        dims = [n_features] + [hidden] * depth + [24]
+        self.weights: list[np.ndarray] = []
+        self.biases:  list[np.ndarray] = []
+        for in_d, out_d in zip(dims[:-1], dims[1:]):
+            self.weights.append(
+                rng.standard_normal((out_d, in_d)).astype(np.float32) * math.sqrt(2 / in_d))
+            self.biases.append(np.zeros(out_d, dtype=np.float32))
         self._init_adam()
 
     def _init_adam(self):
@@ -143,15 +147,26 @@ class MLP:
         self._v = {k: np.zeros_like(v) for k, v in self._params().items()}
         self._t = 0
 
-    def _params(self):
-        return {"W1": self.W1, "b1": self.b1,
-                "W2": self.W2, "b2": self.b2}
+    def _params(self) -> dict:
+        p = {}
+        for i, (W, b) in enumerate(zip(self.weights, self.biases)):
+            p[f"W{i}"] = W
+            p[f"b{i}"] = b
+        return p
 
     def forward(self, x: np.ndarray) -> tuple:
-        h_pre  = self.W1 @ x + self.b1
-        h      = act_forward(self.activation, h_pre)
-        logits = self.W2 @ h + self.b2
-        return logits, (x, h_pre, h)
+        pres: list[np.ndarray] = []
+        acts: list[np.ndarray] = [x]
+        h = x
+        for i, (W, b) in enumerate(zip(self.weights, self.biases)):
+            pre = W @ h + b
+            pres.append(pre)
+            if i < len(self.weights) - 1:
+                h = act_forward(self.activation, pre)
+            else:
+                h = pre  # output layer stays linear
+            acts.append(h)
+        return acts[-1], (pres, acts)
 
     def predict(self, x: np.ndarray) -> int:
         logits, _ = self.forward(x)
@@ -160,40 +175,46 @@ class MLP:
     def backward(self, cache, y: int,
                  label_smooth: float = 0.1,
                  sample_weight: float = 1.0) -> tuple[float, dict]:
-        x, h_pre, h = cache
-        logits = self.W2 @ h + self.b2
+        pres, acts = cache
+        logits = acts[-1]
 
         logits_s = logits - logits.max()
-        exp      = np.exp(logits_s)
-        prob     = exp / exp.sum()
+        exp_l    = np.exp(logits_s)
+        prob     = exp_l / exp_l.sum()
         n        = len(logits)
         target   = np.full(n, label_smooth / n, dtype=np.float32)
         target[y] += 1.0 - label_smooth
         loss = sample_weight * -(target * np.log(prob + 1e-12)).sum()
 
-        d_logits = sample_weight * (prob - target)
-        dW2 = np.outer(d_logits, h)
-        db2 = d_logits
-        dh  = self.W2.T @ d_logits
-        dh_pre = dh * act_backward(self.activation, h_pre, h)
-        dW1 = np.outer(dh_pre, x)
-        db1 = dh_pre
-
-        return loss, {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2}
+        # Backprop through layers in reverse; d_next is grad wrt layer output
+        d_next = sample_weight * (prob - target)
+        grads: dict[str, np.ndarray] = {}
+        for i in range(len(self.weights) - 1, -1, -1):
+            pre   = pres[i]
+            h_out = acts[i + 1]
+            h_in  = acts[i]
+            if i < len(self.weights) - 1:
+                d_pre = d_next * act_backward(self.activation, pre, h_out)
+            else:
+                d_pre = d_next  # output layer is linear
+            grads[f"W{i}"] = np.outer(d_pre, h_in)
+            grads[f"b{i}"] = d_pre
+            d_next = self.weights[i].T @ d_pre
+        return loss, grads
 
     def adam_step(self, grads: dict, lr: float,
                   beta1: float = 0.9, beta2: float = 0.999,
                   eps: float = 1e-8, wd: float = 1e-4):
         self._t += 1
         t = self._t
-        params = self._params()
         for k, g in grads.items():
             self._m[k] = beta1 * self._m[k] + (1 - beta1) * g
             self._v[k] = beta2 * self._v[k] + (1 - beta2) * g * g
             m_hat = self._m[k] / (1 - beta1 ** t)
             v_hat = self._v[k] / (1 - beta2 ** t)
+            p = self._params()[k]
             decay = wd if k.startswith("W") else 0.0
-            params[k] -= lr * (m_hat / (np.sqrt(v_hat) + eps) + decay * params[k])
+            p -= lr * (m_hat / (np.sqrt(v_hat) + eps) + decay * p)
 
 
 # ---------------------------------------------------------------------------
@@ -229,12 +250,13 @@ def train(features: list[np.ndarray], labels: list[int],
           patience: int      = 30,
           seed: int          = 42,
           hidden: int        = 32,
+          depth: int         = 1,
           activation: str    = "relu",
           class_weights: np.ndarray | None = None,
           noise_std: float   = 0.0,
           n_features: int    = 19) -> MLP:
 
-    model = MLP(hidden=hidden, activation=activation, seed=seed, n_features=n_features)
+    model = MLP(hidden=hidden, depth=depth, activation=activation, seed=seed, n_features=n_features)
     rng   = np.random.default_rng(seed)          # ← NEW: rng for noise
     n = len(features)
     idx = np.arange(n)
@@ -244,7 +266,7 @@ def train(features: list[np.ndarray], labels: list[int],
 
     for epoch in range(epochs):
         lr = cosine_lr(epoch, epochs, lr_max)
-        np.random.shuffle(idx)
+        rng.shuffle(idx)
         total_loss = 0.0
 
         for i in idx:
@@ -294,8 +316,9 @@ def train(features: list[np.ndarray], labels: list[int],
                       f"loss={total_loss/n:.4f}  acc={tr_acc:.3f}")
 
     if best_state is not None:
+        params = model._params()
         for k, v in best_state.items():
-            getattr(model, k)[...] = v
+            params[k][...] = v
         print(f"  Restored best checkpoint (val_loss={best_val_loss:.4f})")
 
     return model
@@ -310,12 +333,13 @@ def export_opm_kerasify(model: MLP, out_path: str):
         raise ImportError(
             "opm.ml not found — use --format=binary instead."
         )
-    h = model.W1.shape[0]
-    layers = [Dense(14, h, model.activation), Dense(h, 24, "linear")]
-    layers[0].weights = model.W1.T
-    layers[0].biases  = model.b1
-    layers[1].weights = model.W2.T
-    layers[1].biases  = model.b2
+    n_layers = len(model.weights)
+    dims = [model.weights[0].shape[1]] + [W.shape[0] for W in model.weights]
+    acts = [model.activation] * (n_layers - 1) + ["linear"]
+    layers = [Dense(dims[i], dims[i+1], acts[i]) for i in range(n_layers)]
+    for i, layer in enumerate(layers):
+        layer.weights = model.weights[i].T
+        layer.biases  = model.biases[i]
     export_model(Sequential(layers), out_path)
     print(f"Exported Kerasify model → {out_path}")
 
@@ -324,13 +348,12 @@ def export_binary_fallback(model: MLP, out_path: str):
     LAYER_DENSE = 3
     ACT_LINEAR  = ACT_CODE["linear"]
     act_code    = ACT_CODE[model.activation]
+    n_layers    = len(model.weights)
 
     with open(out_path, "wb") as f:
-        f.write(struct.pack("<I", 2))
-        for (W, b), act in zip(
-            [(model.W1, model.b1), (model.W2, model.b2)],
-            [act_code, ACT_LINEAR],
-        ):
+        f.write(struct.pack("<I", n_layers))
+        for i, (W, b) in enumerate(zip(model.weights, model.biases)):
+            act = ACT_LINEAR if i == n_layers - 1 else act_code
             out_dim, in_dim = W.shape
             f.write(struct.pack("<I", LAYER_DENSE))
             f.write(struct.pack("<I", in_dim))
@@ -374,6 +397,8 @@ def main():
                         default="binary")
     parser.add_argument("--hidden",       type=int,   default=32,
                         help="Hidden layer width (default 32)")
+    parser.add_argument("--depth",        type=int,   default=1,
+                        help="Number of hidden layers (default 1)")
     parser.add_argument("--activation",   choices=list(ACT_CODE.keys()),
                         default="relu",
                         help="Hidden layer activation (default relu)")
@@ -409,7 +434,8 @@ def main():
               f"(cap={args.weight_cap}×mean)")
 
     n_features = len(tr_f[0]) if tr_f else 19
-    arch = f"{n_features}→{args.hidden}→24"
+    hidden_str = "→".join([str(args.hidden)] * args.depth)
+    arch = f"{n_features}→{hidden_str}→24"
     print(f"Training ({arch}, {args.activation}, AdamW, patience={args.patience}"
           + (", class-weighted" if cw is not None else "")
           + (f", noise_std={args.noise_std}" if args.noise_std > 0 else "")
@@ -417,7 +443,8 @@ def main():
     model = train(tr_f, tr_l, va_f, va_l,
                   epochs=args.epochs, lr_max=args.lr,
                   patience=args.patience, seed=args.seed,
-                  hidden=args.hidden, activation=args.activation,
+                  hidden=args.hidden, depth=args.depth,
+                  activation=args.activation,
                   class_weights=cw,
                   noise_std=args.noise_std,
                   n_features=n_features)

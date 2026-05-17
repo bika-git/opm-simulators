@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Generate all 24 CPR config JSON files and run the sweep with OPM flow.
 
