@@ -52,8 +52,13 @@
 #include <opm/simulators/linalg/AbstractISTLSolver.hpp>
 #include <opm/simulators/linalg/printlinearsolverparameter.hpp>
 #include <opm/simulators/linalg/CprPolicyAction.hpp>
+#include <opm/input/eclipse/EclipseState/EclipseState.hpp>
+#include <opm/input/eclipse/EclipseState/Phase.hpp>
+#include <opm/input/eclipse/EclipseState/Runspec.hpp>
+#include <opm/input/eclipse/Schedule/Schedule.hpp>
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/simulators/linalg/CprPolicyFeatures.hpp>
+#include <opm/simulators/linalg/NeuralAbortPolicy.hpp>
 #include <opm/simulators/linalg/NeuralCprPolicy.hpp>
 
 #include <fmt/format.h>
@@ -331,6 +336,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             element_chunks_ = std::make_unique<ElementChunksType>(simulator_.vanguard().gridView(), Dune::Partitions::all, ThreadManager::maxThreads());
 
             initNeuralPolicy();
+            initAbortPolicy();
         }
 
         // Drop the cached matrix pointer so initPrepare() sees the next matrix
@@ -355,6 +361,15 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         /// Also opens the sweep log file if OPM_CPR_SWEEP_LOG is set.
         void initNeuralPolicy()
         {
+            // Explicit baseline mode: retain the upstream property tree and
+            // bypass both trained predictions and the rule-based fallback.
+            const char* disabled = std::getenv("OPM_NEURAL_CPR_DISABLE");
+            if (disabled && std::string(disabled) == "1") {
+                neural_policy_.reset();
+                if (simulator_.gridView().comm().rank() == 0)
+                    OpmLog::info("NeuralCprPolicy: disabled (upstream solver defaults)");
+                return;
+            }
             const char* path = std::getenv("OPM_NEURAL_CPR_WEIGHTS");
             neural_policy_ = std::make_unique<NeuralCprPolicy>(path ? path : "");
             const bool rank0 = (simulator_.gridView().comm().rank() == 0);
@@ -398,6 +413,58 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 }
             }
 
+            // Guards: rule out configs that cannot work or are redundant on this
+            // deck, and set the anchor (the flow-default solver):
+            //   no oil phase  -> trueimpesanalytic (labels 16-23) aborts
+            //   wells present -> only cprw (cpr ignores the well coupling)
+            //   no wells      -> cprw == cpr, so use the cpr labels (anchor 8)
+            // OPM_NEURAL_CPR_GUARDS=0 disables the guards.
+            const bool has_wells = simulator_.vanguard().schedule().numWells() > 0;
+            anchor_label_ = has_wells ? 12 : 8;
+            {
+                const char* guards_env = std::getenv("OPM_NEURAL_CPR_GUARDS");
+                if (!(guards_env && std::string(guards_env) == "0")) {
+                    // From the deck: the fluid system is not initialised yet
+                    // when the linear solver is constructed.
+                    const bool has_oil = simulator_.vanguard().eclState()
+                        .runspec().phases().active(Phase::OIL);
+                    for (int lbl = 0; lbl < 24; ++lbl) {
+                        const bool cprw = (lbl / 4) % 2 == 1;
+                        if ((!has_oil && lbl >= 16) || cprw != has_wells)
+                            neural_policy_->forbidLabel(lbl);
+                    }
+                    if (rank0)
+                        OpmLog::info(std::string("NeuralCprPolicy: guards for a deck ")
+                                     + (has_wells ? "with" : "without") + " wells and "
+                                     + (has_oil ? "with" : "without") + " oil; anchor label "
+                                     + std::to_string(anchor_label_));
+                }
+            }
+
+            // OPM_NEURAL_CPR_MIN_GAIN=g selects anchored decisions for cost
+            // models (train_cpr_cost.py, exported with tau=1): stay on the anchor
+            // unless another config is predicted cheaper by more than g in
+            // log-cost (0.05 ≈ 5 %).
+            if (const char* gain_env = std::getenv("OPM_NEURAL_CPR_MIN_GAIN")) {
+                anchored_mode_ = true;
+                min_gain_ = std::stof(gain_env);
+                if (rank0)
+                    OpmLog::info("NeuralCprPolicy: anchored cost-model decisions, min gain "
+                                 + std::to_string(min_gain_));
+            }
+
+            // OPM_NEURAL_CPR_ACTIONS=amg: the model (train_cpr_amg_policy.py)
+            // chooses the pressure AMG's prolongation damping and coarsening
+            // target at each setup rebuild, anchored on the defaults; the CPR
+            // variant itself stays as configured.
+            if (const char* actions = std::getenv("OPM_NEURAL_CPR_ACTIONS");
+                actions && std::string(actions) == "amg") {
+                amg_mode_ = true;
+                if (rank0)
+                    OpmLog::info("NeuralCprPolicy: choosing AMG prolongation damping and "
+                                 "coarsening target, min gain " + std::to_string(min_gain_));
+            }
+
             if (rank0) {
                 if (neural_policy_->isLoaded())
                     OpmLog::info("NeuralCprPolicy: loaded model from "
@@ -409,6 +476,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             }
 
             const char* log_path = std::getenv("OPM_CPR_SWEEP_LOG");
+            // Sweep mode must be decided identically on every rank: prepare()
+            // branches on it, and both branches contain collectives
+            // (extractFeatures / applyNeuralPolicy).  Only rank 0 owns the file.
+            sweep_mode_ = (log_path != nullptr);
             if (log_path && rank0) {
                 sweep_log_ = std::make_unique<std::ofstream>(
                     log_path, std::ios::app);
@@ -418,7 +489,8 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                            "dt_days,dt_ratio,nl_residual_norm,nl_residual_reduce,"
                            "nl_iteration,nnz_per_row,diag_dominance,"
                            "prev_linsolver_iters,prev_solve_failed,"
-                           "time_elapsed_frac,num_cells_log,block_size\n";
+                           "time_elapsed_frac,num_cells_log,block_size,"
+                           "setup_rebuilt,setup_ms,solve_ms\n";
                            // "well_density,nl_residual_trend,"
                            // "num_phases,dt_cut_count,prev2_linsolver_iters,"
                            // "condition_number_estimate,bhp_well_fraction\n";
@@ -426,6 +498,126 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 OpmLog::info("NeuralCprPolicy: sweep logging to "
                              + std::string(log_path));
             }
+        }
+
+        /// OPM_CPR_ABORT_MODEL=path enables the neural early-abort policy, and
+        /// OPM_CPR_ABORT_THRESHOLD (default 0.95) is the probability of the
+        /// attempt being chopped above which the solve's iteration budget is set
+        /// to zero.  Independent of the config policy; off in sweep mode, which
+        /// records unperturbed runs.
+        void initAbortPolicy()
+        {
+            const char* path = std::getenv("OPM_CPR_ABORT_MODEL");
+            if (!path || sweep_mode_)
+                return;
+            const char* thr = std::getenv("OPM_CPR_ABORT_THRESHOLD");
+            abort_policy_ = std::make_unique<NeuralAbortPolicy>(path, thr ? std::stod(thr) : 0.95);
+            if (!abort_policy_->isLoaded()) {
+                abort_policy_.reset();
+                return;
+            }
+            if (simulator_.gridView().comm().rank() == 0)
+                OpmLog::info("NeuralAbortPolicy: loaded model from " + std::string(path)
+                             + " (abort above probability "
+                             + std::to_string(abort_policy_->threshold()) + ")");
+        }
+
+        /// Features of the abort policy for the solve about to start, in the
+        /// order of train_abort_policy.py (abort_feasibility.py --features
+        /// solver): what the linear solver knows about the timestep attempt.
+        /// Updates the per-attempt history, so call it once per solve, on all
+        /// ranks (the residual norm is a global reduction).
+        NeuralAbortPolicy::Features abortFeatures(const bool rebuild)
+        {
+            constexpr double itsScale = 20.0;  // feature scaling used in training
+            constexpr double ageScale = 30.0;
+            auto& s = abort_state_;
+            const int j = simulator_.problem().iterationContext().iteration();
+            if (j == 0) {
+                // A new attempt; it starts at the same time as the previous one
+                // exactly when that one was chopped.
+                const double t = simulator_.time();
+                const double dt = simulator_.timeStepSize();
+                if (s.have_prev) {
+                    const bool chopped = (t == s.attempt_time);
+                    s.after_chop = chopped;
+                    s.streak = chopped ? s.streak + 1 : 0;
+                    s.prev_iters = chopped ? 0.0 : s.attempt_solves / itsScale;
+                    s.dt_change = (s.attempt_dt > 0.0 && dt > 0.0)
+                        ? std::log10(dt / s.attempt_dt) : 0.0;
+                }
+                s.have_prev = true;
+                s.attempt_time = t;
+                s.attempt_dt = dt;
+                s.attempt_solves = 0;
+                s.its.clear();
+                s.res.clear();
+            }
+            ++s.attempt_solves;
+            s.age = rebuild ? 0 : s.age + 1;
+            if (j > 0)
+                s.its.push_back(cached_linsolver_iters_);
+            const double norm = std::sqrt(simulator_.gridView().comm().sum(rhs_->two_norm2()));
+            s.res.push_back(std::log10(std::max(norm, 1e-30)));
+
+            const double r = s.res.back();
+            int ups = 0;
+            for (std::size_t i = 1; i < s.res.size(); ++i)
+                ups += s.res[i] > s.res[i - 1];
+            const double maxIts = s.its.empty() ? 0.0 : *std::ranges::max_element(s.its);
+            return {{
+                static_cast<float>(j / itsScale),
+                static_cast<float>(s.after_chop),
+                static_cast<float>(std::min(s.streak, 5) / 5.0),
+                static_cast<float>(s.dt_change),
+                static_cast<float>(s.prev_iters),
+                static_cast<float>(j > 0 ? cached_linsolver_iters_ / itsScale : 0.0),
+                static_cast<float>(maxIts / itsScale),
+                static_cast<float>(std::min(s.age, 30) / ageScale),
+                static_cast<float>(rebuild),
+                static_cast<float>(r),
+                static_cast<float>(r - s.res.front()),
+                static_cast<float>(s.res.size() > 1 ? r - s.res[s.res.size() - 2] : 0.0),
+                static_cast<float>(r - *std::ranges::min_element(s.res)),
+                static_cast<float>(double(ups) / s.res.size()),
+            }};
+        }
+
+        /// Ask the abort policy whether to give up on the current timestep
+        /// attempt before this solve.  Rank 0 decides and all ranks follow.
+        bool decideAbort()
+        {
+            // Whether this solve would rebuild the CPR setup, queried without
+            // consuming the one-shot recreate trigger.
+            const bool force_recreate = force_recreate_;
+            const bool rebuild = shouldCreateSolver();
+            force_recreate_ = force_recreate;
+            const auto x = abortFeatures(rebuild);
+
+            // Safety guards, independent of the model.  Aborting causes a chop,
+            // and chops make the next attempt's history look doomed, so an
+            // unchecked policy can chop itself into flow's cut limit (seen on
+            // an unseen deck).  Hence no abort before an attempt's first solve
+            // (no evidence from the attempt yet), and none once three attempts
+            // in a row have been chopped (flow's own logic takes over).
+            const bool allowed = simulator_.problem().iterationContext().iteration() > 0
+                                 && abort_state_.streak < 3;
+
+            const bool rank0 = (simulator_.gridView().comm().rank() == 0);
+            int abort = 0;
+            double p = 0.0;
+            if (rank0 && allowed) {
+                p = abort_policy_->doomProbability(x);
+                abort = p > abort_policy_->threshold();
+            }
+            if (isParallel())
+                simulator_.gridView().comm().broadcast(&abort, 1, 0);
+            if (abort && rank0)
+                OpmLog::debug("NeuralAbortPolicy: giving up on the timestep attempt before "
+                              "the solve of Newton iteration "
+                              + std::to_string(simulator_.problem().iterationContext().iteration())
+                              + " (p=" + std::to_string(p) + ")");
+            return abort != 0;
         }
 
         /// Format the current prm_ config as "type:weight:fine:coarse".
@@ -439,14 +631,16 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                              "preconditioner.coarsesolver.preconditioner.smoother", "ilu0");
         }
 
-        /// Write one row to the sweep CSV.
-        void writeSweepRow(double total_ms)
+        /// Write one row to the sweep CSV.  total_ms = setup_ms + solve_ms,
+        /// where setup is a full rebuild (setup_rebuilt=1) or only the cheap
+        /// preconditioner update() when the CPR setup is reused.
+        void writeSweepRow(double solve_ms)
         {
             *sweep_log_
                 << currentConfigName() << ","
                 << last_episode_idx_   << ","
                 << int(last_feat_.nl_iteration) << ","
-                << total_ms            << ","
+                << last_setup_ms_ + solve_ms << ","
                 << last_feat_.dt_days              << ","
                 << last_feat_.dt_ratio             << ","
                 << last_feat_.nl_residual_norm     << ","
@@ -458,7 +652,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 << last_feat_.prev_solve_failed    << ","
                 << last_feat_.time_elapsed_frac    << ","
                 << last_feat_.num_cells_log        << ","
-                << last_feat_.block_size           << "\n";
+                << last_feat_.block_size           << ","
+                << (last_setup_rebuilt_ ? 1 : 0)   << ","
+                << last_setup_ms_                  << ","
+                << solve_ms                        << "\n";
                 // << last_feat_.well_density               << ","
                 // << last_feat_.nl_residual_trend          << ","
                 // << last_feat_.num_phases                 << ","
@@ -510,9 +707,11 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             feat.prev_linsolver_iters = double(cached_linsolver_iters_);
             feat.prev_solve_failed    = last_solve_failed_ ? 1.0 : 0.0;
 
-            const double endT = simulator_.endTime();
-            feat.time_elapsed_frac = (endT > 0.0)
-                ? std::clamp(simulator_.time() / endT, 0.0, 1.0) : 0.0;
+            // endTime() and startTime() are absolute (POSIX) times; time() is
+            // seconds since the start.
+            const double duration = simulator_.endTime() - simulator_.startTime();
+            feat.time_elapsed_frac = (duration > 0.0)
+                ? std::clamp(simulator_.time() / duration, 0.0, 1.0) : 0.0;
 
             // Global cell count so num_cells_log matches the serial-sweep value.
             {
@@ -634,63 +833,98 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         ///            identical to the one already in prm_.
         ///   Tier 3 — patch only the 1–3 changed fields when the preconditioner
         ///            type is unchanged, rather than rebuilding all 30+ nodes.
-        void applyNeuralPolicy(const Matrix& M)
+        void applyNeuralPolicy(const CprPolicyFeatures& feat)
         {
             // Tier 1: prm_ will not be re-read if we are not about to create a
-            // new solver object.  Skip early.
-            if (!shouldCreateSolver())
+            // new solver object.  Skip early.  shouldCreateSolver() consumes the
+            // one-shot force_recreate_ trigger, which prepareFlexibleSolver()
+            // must still see, so restore it.
+            const bool force_recreate = force_recreate_;
+            const bool create = shouldCreateSolver();
+            force_recreate_ = force_recreate;
+            if (!create)
                 return;
 
-            CprPolicyFeatures feat = extractFeatures(M);
-            float confidence = 0.0f;
-            CprPolicyAction cfg = neural_policy_->predict(feat, &confidence);
+            const bool rank0 = (simulator_.gridView().comm().rank() == 0);
 
-            // On a failed previous solve revert to the safe default config.
-            if (last_solve_failed_)
-                cfg = CprPolicyAction{};
+            if (amg_mode_) {
+                // Choose the AMG parameter levels for the setup about to be
+                // built; the default levels after a failed solve.  Rank 0
+                // decides, all ranks apply the same.
+                int choice[2] = {0, 0};
+                float gain = 0.0f;
+                if (rank0 && !last_solve_failed_) {
+                    const auto [d, t] = neural_policy_->chooseAmgAnchored(feat, min_gain_, &gain);
+                    choice[0] = d;
+                    choice[1] = t;
+                }
+                if (isParallel())
+                    simulator_.gridView().comm().broadcast(choice, 2, 0);
+                const std::string amg = "preconditioner.coarsesolver.preconditioner.";
+                auto& prm = prm_[activeSolverNum_];
+                prm.put(amg + "prolongationdamping", NeuralCprPolicy::kAmgDamping[choice[0]]);
+                prm.put(amg + "coarsenTarget", NeuralCprPolicy::kAmgCoarsenTarget[choice[1]]);
+                if (rank0)
+                    OpmLog::debug("NeuralCprPolicy AMG decision damping="
+                                  + std::to_string(NeuralCprPolicy::kAmgDamping[choice[0]])
+                                  + " coarsenTarget="
+                                  + std::to_string(NeuralCprPolicy::kAmgCoarsenTarget[choice[1]])
+                                  + " gain=" + std::to_string(gain));
+                return;
+            }
 
-            // In a parallel run each MPI rank predicts from its own local matrix
-            // partition, so ranks can independently arrive at different configs.
-            // Rank 0 is authoritative: encode its decision as a label 0-23, or
-            // -1 (below-threshold / keep current config), then broadcast so every
-            // rank applies the same preconditioner structure.  Without this, ranks
-            // build mismatched solver objects and deadlock in AMG / overlap setup.
-            if (isParallel()) {
-                // -1 means "keep current config" (below-threshold case).
-                int label = -1;
-                if (simulator_.gridView().comm().rank() == 0) {
-                    if (!policy_cfg_valid_ || confidence >= confidence_threshold_) {
-                        const int dec    = static_cast<int>(cfg.weight_type);
-                        const int cprw   = cfg.use_cprw ? 1 : 0;
-                        const int fine   = (cfg.fine_smoother   == CprSmoother::DILU) ? 1 : 0;
-                        const int coarse = (cfg.coarse_smoother == CprSmoother::DILU) ? 1 : 0;
-                        label = dec * 8 + cprw * 4 + fine * 2 + coarse;
-                    }
-                }
-                simulator_.gridView().comm().broadcast(&label, 1, 0);
-                if (label < 0)
-                    return;
-                const int d = label / 8, w = (label / 4) % 2,
-                          f = (label / 2) % 2, c = label % 2;
-                switch (d) {
-                case 0:  cfg.weight_type = CprWeightType::QuasiIMPES;         break;
-                case 1:  cfg.weight_type = CprWeightType::TrueIMPES;          break;
-                default: cfg.weight_type = CprWeightType::TrueIMPESAnalytic;  break;
-                }
-                cfg.use_cprw        = (w == 1);
-                cfg.fine_smoother   = (f == 0) ? CprSmoother::ParOverILU0 : CprSmoother::DILU;
-                cfg.coarse_smoother = (c == 0) ? CprSmoother::ILU0        : CprSmoother::DILU;
+            // Softmax confidence (classifier) or predicted log-cost gain over
+            // the anchor (anchored cost-model mode); used for logging.
+            float score = 0.0f;
+            CprPolicyAction cfg;
+            if (anchored_mode_) {
+                // Stay on the anchor (the default solver) unless another config
+                // is predicted cheaper by more than min_gain_, and return to it
+                // after a failed solve.  Each decision is made afresh, so a poor
+                // choice does not persist.  Rank 0 decides and broadcasts, since
+                // ranks predicting from their own partitions could disagree.
+                int label = anchor_label_;
+                if (rank0 && !last_solve_failed_)
+                    label = neural_policy_->chooseAnchored(feat, anchor_label_,
+                                                           min_gain_, &score);
+                if (isParallel())
+                    simulator_.gridView().comm().broadcast(&label, 1, 0);
+                cfg = NeuralCprPolicy::actionFromLabel(label);
             } else {
-                // Serial path: keep existing threshold check.
-                if (policy_cfg_valid_ && confidence < confidence_threshold_)
-                    return;
+                cfg = neural_policy_->predict(feat, &score);
+
+                // On a failed previous solve revert to the default solver.
+                if (last_solve_failed_)
+                    cfg = NeuralCprPolicy::actionFromLabel(anchor_label_);
+
+                // In a parallel run each MPI rank predicts from its own local
+                // matrix partition, so ranks can independently arrive at
+                // different configs.  Rank 0 is authoritative: encode its
+                // decision as a label 0-23, or -1 (below-threshold / keep current
+                // config), then broadcast so every rank applies the same
+                // preconditioner structure.  Without this, ranks build mismatched
+                // solver objects and deadlock in AMG / overlap setup.
+                if (isParallel()) {
+                    int label = -1;
+                    if (rank0 && (!policy_cfg_valid_ || score >= confidence_threshold_))
+                        label = policyLabel(cfg);
+                    simulator_.gridView().comm().broadcast(&label, 1, 0);
+                    if (label < 0)
+                        return;
+                    cfg = NeuralCprPolicy::actionFromLabel(label);
+                } else {
+                    // Serial path: keep existing threshold check.
+                    if (policy_cfg_valid_ && score < confidence_threshold_)
+                        return;
+                }
             }
 
             const bool policy_changed = !policy_cfg_valid_ || !(cfg == last_policy_cfg_);
-            if (simulator_.gridView().comm().rank() == 0) {
+            if (rank0) {
                 OpmLog::debug("NeuralCprPolicy decision label_"
                               + std::to_string(policyLabel(cfg))
-                              + " confidence=" + std::to_string(confidence)
+                              + (anchored_mode_ ? " gain=" : " confidence=")
+                              + std::to_string(score)
                               + " changed=" + std::string(policy_changed ? "yes" : "no")
                               + " " + policyLogStr(cfg));
             }
@@ -727,9 +961,6 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
             last_policy_cfg_    = cfg;
             policy_cfg_valid_   = true;
-            prev_dt_            = simulator_.timeStepSize();
-            prev2_residual_norm_ = prev_residual_norm_;   // shift history
-            prev_residual_norm_  = feat.nl_residual_norm;
         }
 
         static std::string policyLogStr(const CprPolicyAction& a)
@@ -806,13 +1037,13 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             try {
                 initPrepare(M, b);
 
-                if (sweep_log_) {
+                if (sweep_mode_) {
                     // Sweep mode: record features; use static --linear-solver config.
                     last_feat_        = extractFeatures(M);
                     last_episode_idx_ = simulator_.episodeIndex();
                     // Keep prev_* in sync so dt_ratio and nl_residual_reduce are
-                    // meaningful on the next Newton step (these are normally updated
-                    // in applyNeuralPolicy() which is skipped in sweep mode).
+                    // meaningful on the next Newton step (done identically in
+                    // policy mode below).
                     prev_dt_             = simulator_.timeStepSize();
                     prev2_residual_norm_ = prev_residual_norm_;          // shift history
                     prev_residual_norm_  = last_feat_.nl_residual_norm;
@@ -821,9 +1052,20 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                     last_setup_ms_ = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
                 } else {
-                    if (neural_policy_)
-                        applyNeuralPolicy(M);
-                    prepareFlexibleSolver();
+                    if (neural_policy_) {
+                        // Extract features and keep prev_* in sync on every
+                        // solve, exactly as in sweep mode, so the policy sees
+                        // features computed the way its training data was.
+                        const CprPolicyFeatures feat = extractFeatures(M);
+                        applyNeuralPolicy(feat);
+                        prev_dt_             = simulator_.timeStepSize();
+                        prev2_residual_norm_ = prev_residual_norm_;   // shift history
+                        prev_residual_norm_  = feat.nl_residual_norm;
+                    }
+                    // Giving up skips the setup too: solve() fails at once.
+                    abort_now_ = abort_policy_ && decideAbort();
+                    if (!abort_now_)
+                        prepareFlexibleSolver();
                 }
             }
             catch (const Dune::MatrixBlockError&) {
@@ -867,6 +1109,17 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         {
             OPM_TIMEBLOCK(istlSolverSolve);
             ++solveCount_;
+            if (abort_now_) {
+                // The abort policy gave this solve an iteration budget of zero.
+                // Fail it the way a solve that hits maxiter fails, so flow chops
+                // the timestep now instead of after more doomed iterations.
+                abort_now_ = false;
+                iterations_ = 0;
+                last_solve_failed_ = true;
+                OPM_THROW_NOLOG(NumericalProblem,
+                                "Convergence failure for linear solver "
+                                "(neural abort policy gave up on the timestep attempt).");
+            }
             // Write linear system if asked for.
             const int verbosity = prm_[activeSolverNum_].get("verbosity", 0);
             const bool write_matrix = verbosity > 10;
@@ -887,7 +1140,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 if (sweep_log_) {
                     double solve_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
-                    writeSweepRow(last_setup_ms_ + solve_ms);
+                    writeSweepRow(solve_ms);
                 }
             }
 
@@ -961,6 +1214,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 std::function<Vector()> weightCalculator
                     = this->getWeightsCalculator(prm_[activeSolverNum_], pressureIndex);
                 OPM_TIMEBLOCK(flexibleSolverCreate);
+                last_setup_rebuilt_ = true;
                 flexibleSolver_[activeSolverNum_].create(getMatrix(),
                                                          isParallel(),
                                                          prm_[activeSolverNum_],
@@ -973,6 +1227,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             else
             {
                 OPM_TIMEBLOCK(flexibleSolverUpdate);
+                last_setup_rebuilt_ = false;
                 flexibleSolver_[activeSolverNum_].pre_->update();
             }
         }
@@ -1165,6 +1420,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         // Neural CPR policy members
         std::unique_ptr<NeuralCprPolicy> neural_policy_;
         float           confidence_threshold_ = 0.6f;  ///< min softmax prob to allow a config switch
+        bool            anchored_mode_        = false; ///< cost-model decisions (OPM_NEURAL_CPR_MIN_GAIN)
+        float           min_gain_             = 0.05f; ///< log-cost gain needed to leave the anchor
+        int             anchor_label_         = 12;    ///< flow-default solver (8 on decks without wells)
+        bool            amg_mode_             = false; ///< choose AMG parameters (OPM_NEURAL_CPR_ACTIONS=amg)
         bool            last_solve_failed_    = false;
         bool            policy_cfg_valid_     = false;  ///< true once last_policy_cfg_ is set
         CprPolicyAction last_policy_cfg_;               ///< last action written into prm_
@@ -1184,10 +1443,29 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         mutable double cached_bhp_well_fraction_    =  0.0;  ///< refreshed on Newton iter 0
 
         // Sweep logging (OPM_CPR_SWEEP_LOG)
-        std::unique_ptr<std::ofstream> sweep_log_;
+        std::unique_ptr<std::ofstream> sweep_log_;  // rank 0 only
+        bool sweep_mode_ = false;                   // set on all ranks
         CprPolicyFeatures last_feat_{};          ///< features from last extractFeatures()
         int               last_episode_idx_ = 0; ///< simulator episode index at last prepare()
         double            last_setup_ms_    = 0.0; ///< prepareFlexibleSolver() wall time (ms)
+        bool              last_setup_rebuilt_ = false; ///< last prepareFlexibleSolver() rebuilt the solver
+
+        // Neural early-abort policy (OPM_CPR_ABORT_MODEL)
+        std::unique_ptr<NeuralAbortPolicy> abort_policy_;
+        bool abort_now_ = false;  ///< prepare() decided to give up on this attempt
+        struct AbortState {
+            bool   have_prev = false;     ///< an earlier attempt exists
+            bool   after_chop = false;    ///< the previous attempt was chopped
+            int    streak = 0;            ///< consecutive chopped attempts before this one
+            int    attempt_solves = 0;    ///< solves so far in this attempt
+            int    age = 0;               ///< solves since the CPR setup was rebuilt
+            double attempt_time = 0.0;    ///< start time of this attempt (s)
+            double attempt_dt = 0.0;      ///< step size of this attempt (s)
+            double dt_change = 0.0;       ///< log10 of step size over the previous attempt's
+            double prev_iters = 0.0;      ///< Newton iterations of the previous attempt / 20
+            std::vector<double> its;      ///< linear iterations of this attempt's solves
+            std::vector<double> res;      ///< log10 residual norms of this attempt's solves
+        } abort_state_;
     }; // end ISTLSolver
 
 } // namespace Opm

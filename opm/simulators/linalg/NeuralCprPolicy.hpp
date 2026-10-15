@@ -25,7 +25,9 @@
 #include <opm/simulators/linalg/PropertyTree.hpp>
 #include <opm/ml/ml_model.hpp>
 
+#include <array>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Opm {
@@ -75,6 +77,35 @@ public:
     CprPolicyAction predict(const CprPolicyFeatures& feat,
                             float* out_confidence = nullptr) const;
 
+    /// Cost-model mode (models from train_cpr_cost.py exported with tau=1,
+    /// whose outputs are -log(cost) per label).  Returns the cheapest allowed
+    /// label if it is predicted to beat \p anchor by more than \p min_gain
+    /// (in log-cost, 0.05 ≈ 5 %), otherwise \p anchor.  If \p out_gain is
+    /// non-null it receives the predicted log-cost gain of the cheapest label
+    /// over the anchor.  Without a loaded model the anchor is returned.
+    int chooseAnchored(const CprPolicyFeatures& feat, int anchor,
+                       float min_gain, float* out_gain = nullptr) const;
+
+    /// AMG-parameter mode (train_cpr_amg_policy.py): -log cost scores for the
+    /// prolongation damping levels kAmgDamping and the coarsening target levels
+    /// kAmgCoarsenTarget, either one per combination (3 x 3 outputs, damping
+    /// major) or additive per parameter (3 + 3).  Returns the (damping, target)
+    /// level pair with the highest score if it beats the default pair (0, 0) by
+    /// more than \p min_gain in log-cost, otherwise (0, 0).  \p out_gain
+    /// receives that predicted gain.
+    std::pair<int, int> chooseAmgAnchored(const CprPolicyFeatures& feat, float min_gain,
+                                          float* out_gain = nullptr) const;
+    static constexpr std::array<double, 3> kAmgDamping{1.0, 1.3, 1.6};
+    static constexpr std::array<int, 3> kAmgCoarsenTarget{1200, 600, 300};
+
+    bool isForbidden(int label) const
+    {
+        return label < 0 || label >= 24 || (forbidden_mask_ & (1u << label));
+    }
+
+    /// Decode a joint label 0–23 (dec*8 + cprw*4 + fine*2 + coarse).
+    static CprPolicyAction actionFromLabel(int label);
+
     /// Build a complete PropertyTree mirroring setupCPRW() in
     /// setupPropertyTree.cpp, accepted by FlexibleSolver without modification.
     static PropertyTree configToPropertyTree(const CprPolicyAction& act,
@@ -100,6 +131,9 @@ private:
     /// Read the input feature count from the first Dense layer of a binary model file.
     /// Returns CprPolicyFeatures::kNumFeatures on any parse failure.
     static int readModelInputSize(const std::string& path);
+
+    /// Run the MLP; forbidden labels are set to -inf.  False on failure.
+    bool scores(const CprPolicyFeatures& feat, std::vector<float>& out) const;
 
     static CprPolicyAction ruleBasedPredict(const CprPolicyFeatures& feat);
     static CprPolicyAction decodeLogits(const std::vector<float>& logits);

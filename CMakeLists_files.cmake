@@ -1166,6 +1166,7 @@ list (APPEND PUBLIC_HEADER_FILES
   opm/simulators/linalg/ISTLSolverRuntimeOptionProxy.hpp
   opm/simulators/linalg/CprPolicyAction.hpp
   opm/simulators/linalg/CprPolicyFeatures.hpp
+  opm/simulators/linalg/NeuralAbortPolicy.hpp
   opm/simulators/linalg/NeuralCprPolicy.hpp
   opm/simulators/linalg/Preconditioner2InverseOperator.hpp
   opm/simulators/linalg/system/MultiComm.hpp

@@ -22,7 +22,9 @@
 #include <opm/common/OpmLog/OpmLog.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -112,37 +114,43 @@ NeuralCprPolicy::NeuralCprPolicy(const std::string& model_path)
 // Inference
 // ---------------------------------------------------------------------------
 
-CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
-                                          float* out_confidence) const
+bool NeuralCprPolicy::scores(const CprPolicyFeatures& feat,
+                             std::vector<float>& out) const
 {
-    if (!valid_) {
-        if (out_confidence) *out_confidence = 1.0f;
-        return ruleBasedPredict(feat);
-    }
+    if (!valid_)
+        return false;
 
     auto arr = feat.toArray();
     Opm::ML::Tensor<float> in(model_input_size_);
     for (int i = 0; i < model_input_size_; ++i)
         in(i) = arr[i];
 
-    Opm::ML::Tensor<float> out;
-    if (!model_.apply(in, out) || static_cast<int>(out.data_.size()) < 24) {
+    Opm::ML::Tensor<float> res;
+    if (!model_.apply(in, res) || static_cast<int>(res.data_.size()) < 24)
+        return false;
+    out.assign(res.data_.begin(), res.data_.begin() + 24);
+
+    // Forbidden labels get -inf so they are never selected by argmax or
+    // included in the softmax normalisation sum.
+    for (int i = 0; i < 24; ++i) {
+        if (forbidden_mask_ & (1u << i))
+            out[i] = -std::numeric_limits<float>::infinity();
+    }
+    return true;
+}
+
+CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
+                                          float* out_confidence) const
+{
+    std::vector<float> out;
+    if (!scores(feat, out)) {
         if (out_confidence) *out_confidence = 1.0f;
         return ruleBasedPredict(feat);
     }
 
-    // Apply forbidden mask: set disallowed logits to -inf so they are never
-    // selected by argmax or included in the softmax normalisation sum.
-    if (forbidden_mask_) {
-        for (int i = 0; i < 24; ++i) {
-            if (forbidden_mask_ & (1u << i))
-                out.data_[i] = -std::numeric_limits<float>::infinity();
-        }
-    }
-
     if (out_confidence) {
         // Softmax over allowed logits only, numerically stable.
-        const auto* d = out.data_.data();
+        const auto* d = out.data();
         float max_l = -std::numeric_limits<float>::infinity();
         for (int i = 0; i < 24; ++i)
             if (std::isfinite(d[i])) max_l = std::max(max_l, d[i]);
@@ -154,17 +162,77 @@ CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
         *out_confidence = (sum > 0.f) ? std::exp(d[best] - max_l) / sum : 1.0f;
     }
 
-    return decodeLogits(out.data_);
+    return decodeLogits(out);
+}
+
+int NeuralCprPolicy::chooseAnchored(const CprPolicyFeatures& feat, int anchor,
+                                    float min_gain, float* out_gain) const
+{
+    if (out_gain) *out_gain = 0.0f;
+    std::vector<float> out;
+    if (isForbidden(anchor) || !scores(feat, out))
+        return anchor;
+
+    // Outputs are -log(cost): the gain of the best label over the anchor is
+    // log(cost_anchor / cost_best).
+    const int best = static_cast<int>(
+        std::max_element(out.begin(), out.end()) - out.begin());
+    const float gain = out[best] - out[anchor];
+    if (out_gain) *out_gain = gain;
+    return (std::isfinite(gain) && gain > min_gain) ? best : anchor;
+}
+
+std::pair<int, int> NeuralCprPolicy::chooseAmgAnchored(const CprPolicyFeatures& feat,
+                                                       float min_gain, float* out_gain) const
+{
+    if (out_gain) *out_gain = 0.0f;
+    if (!valid_)
+        return {0, 0};
+
+    // No forbidden-label mask here: the outputs are AMG parameter levels.
+    auto arr = feat.toArray();
+    Opm::ML::Tensor<float> in(model_input_size_);
+    for (int i = 0; i < model_input_size_; ++i)
+        in(i) = arr[i];
+    Opm::ML::Tensor<float> res;
+    const auto nd = static_cast<int>(kAmgDamping.size());
+    const auto nt = static_cast<int>(kAmgCoarsenTarget.size());
+    if (!model_.apply(in, res) || static_cast<int>(res.data_.size()) < nd + nt)
+        return {0, 0};
+
+    // nd * nt outputs: one score per combination (captures interactions);
+    // nd + nt outputs: additive per-parameter scores.
+    const auto& o = res.data_;
+    const bool joint = static_cast<int>(o.size()) >= nd * nt;
+    const auto score = [&](int d, int t) { return joint ? o[d * nt + t] : o[d] + o[nd + t]; };
+    const float anchor = score(0, 0);
+    std::pair<int, int> best{0, 0};
+    float bestScore = anchor;
+    for (int d = 0; d < nd; ++d) {
+        for (int t = 0; t < nt; ++t) {
+            const float s = score(d, t);
+            if (s > bestScore) {
+                bestScore = s;
+                best = {d, t};
+            }
+        }
+    }
+    const float gain = bestScore - anchor;
+    if (out_gain) *out_gain = gain;
+    return (std::isfinite(gain) && gain > min_gain) ? best : std::pair<int, int>{0, 0};
 }
 
 CprPolicyAction NeuralCprPolicy::decodeLogits(const std::vector<float>& logits)
 {
-    // Joint 3×2×2×2 = 24-way output.
-    // Index i encodes: dec = i/8, cprw = (i/4)%2, fine = (i/2)%2, coarse = i%2
     // Forbidden labels have been set to -inf before this call.
     const auto best = std::max_element(logits.begin(), logits.begin() + 24);
-    const int  idx  = static_cast<int>(std::distance(logits.begin(), best));
+    return actionFromLabel(static_cast<int>(std::distance(logits.begin(), best)));
+}
 
+CprPolicyAction NeuralCprPolicy::actionFromLabel(int idx)
+{
+    // Joint 3×2×2×2 = 24-way output.
+    // Index i encodes: dec = i/8, cprw = (i/4)%2, fine = (i/2)%2, coarse = i%2
     const int dec    = idx / 8;
     const int cprw   = (idx / 4) % 2;
     const int fine   = (idx / 2) % 2;
@@ -223,7 +291,8 @@ PropertyTree NeuralCprPolicy::configToPropertyTree(const CprPolicyAction& act,
     prm.put("solver",    "bicgstab"s);
 
     prm.put("preconditioner.type",             act.use_cprw ? "cprw"s : "cpr"s);
-    prm.put("preconditioner.use_well_weights", act.use_cprw ? "true"s : "false"s);
+    // Matches setupCPRW() (the flow default): well weights off.
+    prm.put("preconditioner.use_well_weights", "false"s);
     prm.put("preconditioner.add_wells",        act.use_cprw ? "true"s : "false"s);
     prm.put("preconditioner.weight_type",      weightTypeStr(act.weight_type));
     prm.put("preconditioner.pre_smooth",       0);
