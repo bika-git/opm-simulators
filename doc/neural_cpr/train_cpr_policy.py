@@ -226,12 +226,15 @@ def make_class_weights(labels: list[int], n_classes: int = 24,
     """Inverse-frequency weights, capped at cap × mean weight."""
     counts = Counter(labels)
     n = len(labels)
-    raw = np.array([n / max(counts.get(c, 1), 1) for c in range(n_classes)],
-                   dtype=np.float64)
-    mean_w = raw.mean()
+    # Classes absent from the data get weight 0; including them in the mean
+    # would inflate it and shrink the weights of the classes that are present.
+    raw = np.array([n / counts[c] if counts.get(c) else 0.0
+                    for c in range(n_classes)], dtype=np.float64)
+    present = raw > 0
+    mean_w = raw[present].mean()
     raw = np.minimum(raw, cap * mean_w)
-    # Normalise so mean = 1
-    return (raw / raw.mean()).astype(np.float32)
+    # Normalise so the mean over present classes = 1
+    return (raw / raw[present].mean()).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

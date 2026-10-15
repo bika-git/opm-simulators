@@ -85,6 +85,9 @@ AMG_DEFAULTS = {
 
 
 def make_json(cfg: dict, tol: float = 0.005, maxiter: int = 20) -> dict:
+    # tol/maxiter are flow's CPR defaults (cprDefaultReduction/MaxIter in
+    # setupPropertyTree.cpp) and the cprw well settings match setupCPRW(), so
+    # label 12 reproduces the default solver exactly.
     amg = dict(AMG_DEFAULTS)
     amg["smoother"] = cfg["coarse"]
 
@@ -107,7 +110,7 @@ def make_json(cfg: dict, tol: float = 0.005, maxiter: int = 20) -> dict:
         },
     }
     if cfg["ptype"] == "cprw":
-        prec["use_well_weights"] = "true"
+        prec["use_well_weights"] = "false"
         prec["add_wells"]        = "true"
 
     return {
@@ -143,7 +146,8 @@ def run_one(flow_cmd: list[str], deck: str, cfg: dict, json_path: Path,
     cmd = [
         *flow_cmd,
         f"--linear-solver={json_path}",
-        "--cpr-reuse-setup=0",
+        # Default CPR setup reuse, so timings reflect a production run; the
+        # CSV's setup_rebuilt column marks the solves that rebuilt the setup.
         f"--output-dir={out_dir}",
         deck,
     ]

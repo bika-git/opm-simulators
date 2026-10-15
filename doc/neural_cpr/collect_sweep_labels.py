@@ -2,7 +2,9 @@
 from __future__ import annotations
 """
 Combine per-Newton-step CSV files from the sweep and assign a label
-(best config index) to each (deck, episode, newton_iter) sample.
+(best config index) to each (deck, episode, attempt, dt, newton_iter) sample,
+i.e. to each linear solve that several configs reached with an identical
+timestep history.
 
 Usage
 -----
@@ -79,6 +81,10 @@ def main():
                         help="Output CSV path (default: training_data.csv)")
     parser.add_argument("--min-configs", type=int, default=2,
                         help="Minimum configs per sample to keep (default: 2)")
+    parser.add_argument("--merge-cprw", action="store_true",
+                        help="Treat cprw:* as cpr:* (for decks without wells, "
+                             "where CPRW builds the same preconditioner as CPR "
+                             "and the pair differs only by timing noise)")
     args = parser.parse_args()
 
     # Detect which feature columns are actually present across all input files.
@@ -93,8 +99,8 @@ def main():
     print(f"Feature columns detected: {len(active_feature_cols)} "
           f"({', '.join(active_feature_cols)})")
 
-    # key → {config: [total_ms, ...], features: row_dict}
-    samples: dict[tuple, dict] = defaultdict(lambda: {"times": {}, "feat": None})
+    # key → {config: [total_ms, ...], feats: {config: row_dict}}
+    samples: dict[tuple, dict] = defaultdict(lambda: {"times": {}, "feats": {}})
 
     total_rows = 0
     for path in args.csvs:
@@ -104,28 +110,35 @@ def main():
 
         with open(path, newline="") as fh:
             reader = csv.DictReader(fh)
+            episode, attempt = None, -1
             for row in reader:
                 total_rows += 1
-                # Include deck so Newton steps from different reservoirs are
-                # never merged together (they share episode/newton_iter numbering).
-                key = (deck, row["episode"], row["newton_iter"])
+                # Identify the solve by its position in the timestep history:
+                # report step, timestep attempt within it (a new attempt starts
+                # at newton_iter 0; chopped retries count as attempts), step
+                # size and Newton iteration.  Configs only share a key while
+                # their timestep histories are identical, so each sample
+                # compares the same linear system across configs.  Report
+                # steps are fixed in time, so alignment restarts at each one.
+                if row["episode"] != episode:
+                    episode, attempt = row["episode"], -1
+                if row["newton_iter"] == "0":
+                    attempt += 1
+                key = (deck, episode, attempt, row["dt_days"], row["newton_iter"])
                 config = row["config"]
+                if args.merge_cprw and config.startswith("cprw:"):
+                    config = "cpr:" + config[len("cprw:"):]
                 ms = float(row["total_ms"])
 
                 entry = samples[key]
-                if config not in entry["times"]:
-                    entry["times"][config] = []
-                entry["times"][config].append(ms)
-
-                if entry["feat"] is None:
-                    entry["feat"] = {
-                        c: row.get(c, "0") if c in OPTIONAL_FEATURE_COLS else row[c]
-                        for c in active_feature_cols
-                    }
-                    entry["feat"]["deck"] = deck
+                entry["times"].setdefault(config, []).append(ms)
+                entry["feats"].setdefault(config, {
+                    c: row.get(c, "0") if c in OPTIONAL_FEATURE_COLS else row[c]
+                    for c in active_feature_cols
+                })
 
     print(f"Read {total_rows} rows from {len(args.csvs)} files.")
-    print(f"Unique (deck, episode, newton_iter) keys: {len(samples)}")
+    print(f"Unique (deck, episode, attempt, dt, newton_iter) keys: {len(samples)}")
 
     out_rows = []
     skipped = 0
@@ -140,7 +153,12 @@ def main():
                        for cfg, ms in times.items()}
         best_config = min(median_time, key=median_time.__getitem__)
 
-        row = dict(entry["feat"])
+        # Features: per-column median over the matched configs, so the sample
+        # does not depend on which CSV happened to be read first.
+        feats = list(entry["feats"].values())
+        row = {c: sorted(float(f[c]) for f in feats)[len(feats) // 2]
+               for c in active_feature_cols}
+        row["deck"] = key[0]
         row["best_config"] = best_config
         row["label"]       = config_to_label(best_config)
         out_rows.append(row)
@@ -150,7 +168,7 @@ def main():
 
     if not out_rows:
         print("ERROR: no output samples — check that multiple config CSVs cover the "
-              "same (episode, newton_iter) keys.", file=sys.stderr)
+              "same (episode, attempt, dt, newton_iter) keys.", file=sys.stderr)
         sys.exit(1)
 
     # Label distribution
