@@ -6,219 +6,188 @@
 
 ## Purpose
 
-`NeuralCPRPolicy` is the decision engine.  Given a `NeuralCPRFeatures`
-struct it produces a `CPRConfig` — a discrete choice across three solver
-axes — and can serialise that choice into an `Opm::PropertyTree` that
-`FlexibleSolver::create()` consumes directly.
+Three complementary neural policies adapt the CPR linear solver at runtime:
 
-Two operating modes:
-
-| Mode | Condition | Behaviour |
+| Policy | Env var | What it controls |
 |---|---|---|
-| **MLP inference** | Weight file loaded (`isLoaded() == true`) | Forward pass through 8→32→16→8 network |
-| **Rule-based fallback** | No weight file / file unreadable | Deterministic heuristic, no file I/O |
+| **CPR variant** (neural-v3) | `OPM_NEURAL_CPR_WEIGHTS` | Which of 24 CPR configurations (decoupling × smoother) to use each Newton step |
+| **Neural AMG** | `OPM_NEURAL_CPR_WEIGHTS` + `OPM_NEURAL_CPR_ACTIONS=amg` | Prolongation damping and coarsening target of the pressure AMG at each CPR setup rebuild |
+| **Neural abort** | `OPM_CPR_ABORT_MODEL` | Whether to give up on a timestep attempt that is likely to be chopped |
+
+All three share the same binary model file format and are loaded by `Opm::ML::NNModel`.
 
 ---
 
-## CPRConfig
+## CPR variant policy
 
-```cpp
-struct CPRConfig {
-    CPRDecoupling    decoupling;   // QuasiIMPES | TrueIMPES | TrueIMPESAnalytic
-    bool             use_cprw;    // true → "cprw", false → "cpr"
-    CPRFineSmoother  fine;        // ParOverILU0 | DILU
-    CPRCoarseSmoother coarse;     // ILU0 | DILU
-};
-```
-
-`CPRConfig` has value semantics and provides `operator==` / `operator!=`,
-which the caching layer in `ISTLSolver` uses to detect when the config has
-changed and a PropertyTree update is needed.
-
----
-
-## MLP architecture
+### Architecture
 
 ```
-input   (8)  ──► Linear(8→32) + ReLU
-hidden  (32) ──► Linear(32→16) + ReLU
-hidden  (16) ──► Linear(16→8)
-logits  (8)  ──► decode
+input   (N)  ──► Dense(N→H, ReLU) [× depth]
+hidden  (H)  ──► Dense(H→24, linear)
+logits  (24) ──► argmax → label 0–23
 ```
 
-Output decoding (argmax / threshold per group):
+N is the number of features in the training CSV (12 core features, up to 19
+with extended columns). H and depth are controlled by `--hidden` / `--depth`
+in `train_cpr_policy.py` (defaults: H=32, depth=1). The benchmark uses the
+best H from an architecture search over {8, 12, 16, 24, 32}.
 
-| Logit slice | Decision |
-|---|---|
-| `[0:3]` — 3 values | `argmax` → decoupling (0=QuasiIMPES, 1=TrueIMPES, 2=Analytic) |
-| `[3]` — scalar | `> 0` → `use_cprw = true` |
-| `[4:6]` — 2 values | `argmax` → fine smoother (0=ParOverILU0, 1=DILU) |
-| `[6:8]` — 2 values | `argmax` → coarse smoother (0=ILU0, 1=DILU) |
+Output label encoding (flat joint space):
 
-Total output dimension: 8 logits encoding 3 + 1 + 2 + 2 independent decisions.
-Each decision head is trained with separate cross-entropy loss against the
-label produced by the data-collection sweep.
+```
+label = dec*8 + cprw*4 + fine*2 + coarse
 
----
+dec   : 0=quasiimpes  1=trueimpes  2=trueimpesanalytic
+cprw  : 0=cpr         1=cprw
+fine  : 0=paroverilu0 1=dilu
+coarse: 0=ilu0        1=dilu
+```
 
-## Rule-based fallback
+Labels 0–23 span all combinations; the argmax of the 24 logits gives the
+predicted cheapest config. A softmax confidence check
+(`OPM_NEURAL_CPR_CONFIDENCE`, default 0.6) gates the switch; labels can be
+forbidden per deck with `OPM_NEURAL_CPR_FORBID_LABELS`.
 
-When no weight file is available the policy uses a deterministic heuristic
-that captures the most important insight from the OPM documentation: the
-first Newton step of each timestep is structurally easier and tolerates
-cheaper weight computation.
+### Rule-based fallback
+
+When no weight file is loaded the policy uses a deterministic heuristic:
 
 ```
 Newton iter 0 (first linearisation of a new timestep):
-    → quasiimpes + ParOverILU0 + ILU0
-    Justification: quasiimpes computes weights from storage terms only
-    (O(n) diagonal operations vs. O(n × numEq³) local solves for trueimpes).
-    ParOverILU0 setup is also faster than DILU for well-conditioned systems.
+    → quasiimpes + cpr + paroverilu0 + ilu0
+    Cheap weight computation; first step is structurally easy.
 
-Slow convergence (iter > 0 and residual_reduce > 0.5) or many iterations (≥ 4):
-    → trueimpes + DILU + ILU0
-    Justification: the more accurate decoupling and more robust smoother
-    are needed when the Newton sequence is struggling.
+Slow convergence (iter > 0 and residual_reduce > 0.5) or many iters (≥ 4):
+    → trueimpes + cprw + dilu + ilu0
+    More accurate decoupling and robust smoother when Newton struggles.
 
-Otherwise (iter 1–3, converging well):
-    → quasiimpes + DILU + ILU0
-    Balanced: cheap decoupling, robust smoother.
+Otherwise (iters 1–3, converging well):
+    → quasiimpes + cprw + dilu + ilu0
 ```
-
-Benchmark impact of the rule-based fallback on SPE9 with `--cpr-reuse-setup=0`:
-**−13% linear iterations** (418 vs 481) compared to the static `trueimpes`
-baseline, because the cheaper quasiimpes config on Newton iter 0 produces a
-different AMG hierarchy that converges in fewer Krylov steps on that particular
-call.
 
 ---
 
-## PropertyTree construction
+## Neural AMG policy
 
-`configToPropertyTree(cfg, tol, maxiter)` produces a complete Boost property
-tree that mirrors the output of `setupCPRW()` in `setupPropertyTree.cpp` line
-for line.  All 20+ fields are populated with the same defaults as the
-standard `cprw` configuration; only the three axis-specific fields differ:
+Loaded when `OPM_NEURAL_CPR_ACTIONS=amg` is set alongside
+`OPM_NEURAL_CPR_WEIGHTS`. Controls two AMG parameters chosen at each CPR
+setup rebuild:
 
-| Property tree key | Controlled by |
+| Parameter | Options |
 |---|---|
-| `preconditioner.type` | `cfg.use_cprw` → `"cprw"` or `"cpr"` |
-| `preconditioner.weight_type` | `cfg.decoupling` → `"quasiimpes"` / `"trueimpes"` / `"trueimpesanalytic"` |
-| `preconditioner.finesmoother.type` | `cfg.fine` → `"dilu"` or `"paroverilu0"` |
-| `preconditioner.coarsesolver.preconditioner.smoother` | `cfg.coarse` → `"ilu0"` or `"dilu"` |
+| Prolongation damping | 1.0 / 1.3 / 1.6 |
+| Coarsening target | 1200 / 600 / 300 |
 
-All other AMG parameters (`alpha`, `coarsenTarget`, `maxaggsize`, etc.) are
-identical to the OPM defaults from `setupDuneAMG()`.
+### Architecture
 
-`updatePropertyTreeInPlace(cfg, prev, prm)` is the selective-update variant:
-when the preconditioner type is unchanged it calls `put()` only for the 1–3
-fields that differ, avoiding a full 30-node Boost ptree rebuild.
+```
+input   (12) ──► Dense(12→H, ReLU) [× depth]
+hidden  (H)  ──► Dense(H→9, linear)   [default layout; 6 with --additive]
+outputs (9)  ──► argmax → (damping index, target index)
+```
+
+Outputs are negated log costs (`−log ms`), so the argmax gives the predicted
+cheapest combination. The default anchor (`OPM_NEURAL_CPR_MIN_GAIN`, default
+0.05) keeps the policy on the default (1.0, 1200) unless another combination
+is predicted at least 5% cheaper (in log-cost).
+
+Trained by `train_cpr_amg_policy.py` from sweep CSVs produced by
+`run_amg_sweep.py`. Uses an ensemble of 5 bootstrap members averaged at
+export time.
 
 ---
 
-## Weight file format
+## Neural abort policy
 
-The binary weight file is a compact flat layout, with no external library
-dependency for reading:
+Loaded via `OPM_CPR_ABORT_MODEL`. At every Newton iteration of a timestep
+attempt that has not converged yet, predicts the probability that the attempt
+will be chopped. If `prob > OPM_CPR_ABORT_THRESHOLD` (default 0.95), Flow
+gives up on the attempt early.
+
+### Architecture
 
 ```
-Offset   Size    Content
-0        4 B     Magic: 0x4E435052 ('NCPR' little-endian uint32)
-4        4 B     Version: 1 (uint32)
-8        1024 B  W1[32][8]  — layer-1 weight matrix, row-major, float32
-1032     128 B   b1[32]     — layer-1 bias vector, float32
-1160     2048 B  W2[16][32] — layer-2 weight matrix, row-major, float32
-3208     64 B    b2[16]     — layer-2 bias vector, float32
-3272     512 B   W3[8][16]  — layer-3 weight matrix, row-major, float32
-3784     32 B    b3[8]      — layer-3 bias vector, float32
-──────────────────────────────────────────────────────
-Total    3816 B
+input   (14) ──► Dense(14→H, ReLU)
+hidden  (H)  ──► Dense(H→1, linear)
+output  (1)  ──► sigmoid → P(chop)
 ```
 
-All numeric values are IEEE-754 single-precision, little-endian.  The
-reader in `loadWeights()` verifies the magic and version before accepting
-the file; a mismatch silently falls back to rule-based mode.
+H defaults to 16. Input standardisation `(x − μ) / σ` is folded into the
+first layer at export time, so Flow feeds raw features with no preprocessing.
 
-### Python export snippet
+The 14 features are (in order):
 
-```python
-import struct
-
-MAGIC, VERSION = 0x4E435052, 1
-
-def export_weights(model, path):
-    """Export a trained CPRPolicy (torch.nn.Module) to the binary format."""
-    sd = {k: v.detach().numpy() for k, v in model.state_dict().items()}
-    with open(path, "wb") as f:
-        f.write(struct.pack("<II", MAGIC, VERSION))
-        for key in ["net.0.weight", "net.0.bias",
-                    "net.2.weight", "net.2.bias",
-                    "net.4.weight", "net.4.bias"]:
-            data = sd[key].flatten().tolist()
-            f.write(struct.pack(f"<{len(data)}f", *data))
+```
+SOLVER_KNOWN (5):  iteration, after_chop, chop_streak, dt_change, prev_iters
+CPR_FEATURES (4):  last_lin_its, max_lin_its, setup_age, rebuilt_now
+RES_FEATURES (5):  log_res, res_vs_start, res_step, res_vs_best, res_frac_up
 ```
 
-Layer order in `state_dict`: `net.0` = Linear(8→32), `net.2` = Linear(32→16),
-`net.4` = Linear(16→8).  Weights are stored row-major as PyTorch exports them.
+Trained by `train_abort_policy.py` from flow `.DBG` logs paired with sweep
+CSVs (`OPM_CPR_SWEEP_LOG`).
+
+---
+
+## Binary model file format
+
+All three policies use the same format, written by `export_binary_fallback`
+in `train_cpr_policy.py`:
+
+```
+Offset  Size    Content
+0       4 B     n_layers  (uint32, little-endian)
+
+For each layer i = 0 … n_layers-1:
+  0     4 B     layer type = 3  (LAYER_DENSE, uint32)
+  4     4 B     in_dim  (uint32)
+  8     4 B     out_dim (uint32)
+  12    4 B     out_dim (uint32, repeated — Kerasify-compatible header)
+  16    in_dim × out_dim × 4 B    W.T  (float32, row-major, transposed weights)
+  …     out_dim × 4 B             b    (float32, bias)
+  …     4 B     activation code  (uint32)
+                  1 = linear  (last layer)
+                  2 = relu    (hidden layers)
+                  3 = softplus
+                  6 = tanh
+```
+
+All numeric values are IEEE-754 single-precision, little-endian. There is no
+magic number or version field; the reader in `Opm::ML::NNModel` identifies
+the layout from `n_layers` and the per-layer dimension headers.
+
+---
+
+## Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OPM_NEURAL_CPR_WEIGHTS` | unset | Path to CPR variant or AMG model file |
+| `OPM_NEURAL_CPR_ACTIONS` | `variant` | `variant` = CPR config policy; `amg` = AMG parameter policy |
+| `OPM_NEURAL_CPR_MIN_GAIN` | `0.05` | AMG policy: minimum log-cost gain to switch from default |
+| `OPM_NEURAL_CPR_CONFIDENCE` | `0.6` | CPR variant: softmax confidence threshold to switch |
+| `OPM_NEURAL_CPR_FORBID_LABELS` | unset | Comma-separated label indices to exclude (e.g. `16,17,18,19,20,21,22,23` for SPE11) |
+| `OPM_NEURAL_CPR_DISABLE` | unset | Set to `1` to disable CPR variant policy (run abort-only) |
+| `OPM_CPR_ABORT_MODEL` | unset | Path to abort policy model file |
+| `OPM_CPR_ABORT_THRESHOLD` | `0.95` | Abort policy: probability threshold to give up on an attempt |
+| `OPM_CPR_SWEEP_LOG` | unset | Path for per-Newton-step solver CSV written during sweep runs |
 
 ---
 
 ## Training pipeline
 
-### Data collection
+```
+Step 0  run_sweep.py          → sweep CSVs (24 configs × decks × runs)
+Step 1  collect_sweep_labels.py → labelled training CSV (best config per solve)
+Step 2  pretrain_cpr_policy.py  → encoder .npz (optional warm-start)
+        train_cpr_policy.py     → cpr_policy.model  (CPR variant)
 
-Run the simulator with each configuration across a set of benchmark decks,
-recording `(features, config, wall_time)` tuples.  The existing
-`--linear-solver` flags cover the full config space:
-
-```bash
-for conf in cprw cpr_trueimpes cpr_quasiimpes cpr_trueimpesanalytic; do
-  flow --linear-solver=$conf --output-dir=sweep/$conf DECK.DATA
-done
+Separately:
+        run_amg_sweep.py        → AMG sweep CSVs
+        train_cpr_amg_policy.py → cpr_amg_policy.model
+        train_abort_policy.py   → abort.model  (from sweep .DBG logs)
 ```
 
-Feature logging can be enabled by setting the OPM log verbosity to debug
-level and parsing the `NeuralCPRPolicy:` lines from the `.DBG` file (or by
-instrumenting `ISTLSolver::extractFeatures()` to write a CSV).
-
-### Model definition (PyTorch)
-
-```python
-import torch.nn as nn
-
-class CPRPolicy(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(8, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
-            nn.Linear(16, 8),
-        )
-
-    def forward(self, x):
-        return self.net(x)   # raw logits, shape [B, 8]
-```
-
-### Loss and labels
-
-Labels are the config index (per output head) whose wall-time-per-Newton-step
-was minimum in the sweep.  Train each head independently with cross-entropy:
-
-```python
-# logits shape [B,8]; labels shape [B] each
-loss = (
-    F.cross_entropy(logits[:, 0:3], label_dec) +
-    F.binary_cross_entropy_with_logits(logits[:, 3], label_cprw.float()) +
-    F.cross_entropy(logits[:, 4:6], label_fine) +
-    F.cross_entropy(logits[:, 6:8], label_coarse)
-)
-```
-
-### Recommended sweep cases
-
-| Case | Cells | Phases | Why |
-|---|---|---|---|
-| SPE1 | 300 | 3 | Baseline; fast to sweep many configs |
-| SPE3 | 9,000 | 3 | Medium complexity |
-| SPE9 | 9,000 | 3 | Heterogeneous permeability |
-| NORNE_ATW2013 | 45,217 | 3 | Full field, diverse timestep difficulty |
+All training scripts are pure NumPy with a hand-written AdamW optimiser.
+No PyTorch or TensorFlow dependency. Continual learning (EWC + replay
+buffers) is supported by all three via `continual.py`.

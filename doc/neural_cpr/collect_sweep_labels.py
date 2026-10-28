@@ -85,6 +85,12 @@ def main():
                         help="Treat cprw:* as cpr:* (for decks without wells, "
                              "where CPRW builds the same preconditioner as CPR "
                              "and the pair differs only by timing noise)")
+    parser.add_argument("--append-to", default=None,
+                        help="Existing training CSV to extend with new sweep "
+                             "data.  Old rows whose keys do not appear in the "
+                             "new sweep CSVs are kept as-is; overlapping keys "
+                             "are re-labelled from the merged timing data.  "
+                             "This avoids re-processing old sweep CSVs.")
     args = parser.parse_args()
 
     # Detect which feature columns are actually present across all input files.
@@ -165,6 +171,35 @@ def main():
 
     print(f"Skipped {skipped} samples (fewer than {args.min_configs} configs).")
     print(f"Output samples: {len(out_rows)}")
+
+    # ── Append mode: merge with existing training CSV ──
+    if args.append_to:
+        old_count = 0
+        new_keys = set()
+        for r in out_rows:
+            # Reconstruct the key from the row so we can detect overlaps.
+            # Rows from the new sweep carry deck, dt_days, nl_iteration etc.
+            new_keys.add((r["deck"],
+                          str(r.get("dt_days", "")),
+                          str(r.get("nl_iteration", ""))))
+        with open(args.append_to, newline="") as fh:
+            for row in csv.DictReader(fh):
+                key = (row["deck"],
+                       str(row.get("dt_days", "")),
+                       str(row.get("nl_iteration", "")))
+                if key not in new_keys:
+                    # Convert numeric strings back to float where needed.
+                    for c in active_feature_cols:
+                        if c in row:
+                            try:
+                                row[c] = float(row[c])
+                            except (ValueError, TypeError):
+                                pass
+                    row["label"] = int(row["label"])
+                    out_rows.append(row)
+                    old_count += 1
+        print(f"Append mode: kept {old_count} old rows from {args.append_to}, "
+              f"updated {len(out_rows) - old_count} from new sweep CSVs.")
 
     if not out_rows:
         print("ERROR: no output samples — check that multiple config CSVs cover the "

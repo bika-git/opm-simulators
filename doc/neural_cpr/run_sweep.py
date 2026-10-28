@@ -182,7 +182,7 @@ def main():
     # Build the flow command: prepend mpirun when --nprocs > 1.
     if args.nprocs > 1:
         flow_cmd = ["mpirun", "-np", str(args.nprocs),
-                    "--bind-to", "none", "--mca", "btl", "self,sm",
+                    "--bind-to", "none",
                     args.flow]
     else:
         flow_cmd = [args.flow]

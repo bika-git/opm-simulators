@@ -36,6 +36,11 @@ from collections import Counter
 
 import numpy as np
 
+from continual import (compute_fisher_diagonal, ewc_penalty_grads,
+                       save_anchor, load_anchor, merge_fisher,
+                       save_replay_buffer, load_replay_buffer,
+                       select_exemplars)
+
 # ---------------------------------------------------------------------------
 # opm-common Kerasify export (optional)
 # ---------------------------------------------------------------------------
@@ -277,7 +282,10 @@ def train(features: list[np.ndarray], labels: list[int],
           class_weights: np.ndarray | None = None,
           noise_std: float   = 0.0,
           n_features: int    = 19,
-          pretrained: str | None = None) -> MLP:
+          pretrained: str | None = None,
+          ewc_anchor: dict[str, np.ndarray] | None = None,
+          ewc_fisher: dict[str, np.ndarray] | None = None,
+          ewc_lambda: float  = 0.0) -> MLP:
 
     model = MLP(hidden=hidden, depth=depth, activation=activation, seed=seed, n_features=n_features)
 
@@ -306,6 +314,11 @@ def train(features: list[np.ndarray], labels: list[int],
                             0.0, 1.0)
             _, cache = model.forward(x)
             loss, grads = model.backward(cache, labels[i], sample_weight=sw)
+            if ewc_anchor is not None and ewc_lambda > 0:
+                ewc_g = ewc_penalty_grads(model._params(), ewc_anchor,
+                                          ewc_fisher, ewc_lambda)
+                for k in grads:
+                    grads[k] = grads[k] + ewc_g[k]
             model.adam_step(grads, lr)
             total_loss += loss
 
@@ -398,13 +411,14 @@ def export_binary_fallback(model: MLP, out_path: str):
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_csv(path: str) -> tuple[list[np.ndarray], list[int]]:
-    features, labels = [], []
+def load_csv(path: str) -> tuple[list[np.ndarray], list[int], list[str]]:
+    features, labels, decks = [], [], []
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh):
             features.append(normalise(row))
             labels.append(int(row["label"]))
-    return features, labels
+            decks.append(row.get("deck", "unknown"))
+    return features, labels, decks
 
 
 # ---------------------------------------------------------------------------
@@ -440,12 +454,61 @@ def main():
     parser.add_argument("--pretrained",   default=None,
                         help=".npz encoder file from pretrain_cpr_policy.py "
                              "(warm-starts encoder layers instead of random init)")
+
+    # ── Continual learning ──
+    cl = parser.add_argument_group("continual learning",
+            "Incremental training on new decks without forgetting old ones")
+    cl.add_argument("--anchor", default=None,
+                    help="Anchor .npz from previous training (enables EWC)")
+    cl.add_argument("--ewc-lambda", type=float, default=1.0,
+                    help="EWC penalty strength (default 1.0)")
+    cl.add_argument("--replay-buffer", default=None,
+                    help="Replay buffer .npz — old samples mixed into training")
+    cl.add_argument("--replay-frac", type=float, default=0.5,
+                    help="Replay samples as fraction of new data (default 0.5)")
+    cl.add_argument("--save-anchor", default=None,
+                    help="Save anchor + Fisher to .npz after training")
+    cl.add_argument("--save-replay", default=None,
+                    help="Save replay buffer to .npz after training")
+    cl.add_argument("--replay-budget", type=int, default=200,
+                    help="Exemplar budget per deck for replay (default 200)")
+    cl.add_argument("--fisher-decay", type=float, default=0.9,
+                    help="EMA decay for merging Fisher diagonals (default 0.9)")
+    cl.add_argument("--fisher-samples", type=int, default=None,
+                    help="Max samples for Fisher estimation (default: all)")
     args = parser.parse_args()
 
     print(f"Loading {args.data} ...")
-    features, labels = load_csv(args.data)
+    features, labels, decks = load_csv(args.data)
     n = len(features)
-    print(f"  {n} samples, {len(set(labels))} distinct labels (of 24)")
+    deck_counts = Counter(decks)
+    print(f"  {n} samples, {len(set(labels))} distinct labels (of 24), "
+          f"{len(deck_counts)} decks ({dict(deck_counts.most_common(5))})")
+
+    # ── Replay buffer: mix old exemplars into new training data ──
+    replay_decks: list[str] = []
+    if args.replay_buffer:
+        replay_f, replay_l, replay_d = load_replay_buffer(args.replay_buffer)
+        n_replay = min(int(n * args.replay_frac), len(replay_f))
+        rng_r = np.random.default_rng(args.seed)
+        r_idx = rng_r.choice(len(replay_f), n_replay, replace=False)
+        features.extend(replay_f[i] for i in r_idx)
+        labels.extend(replay_l[i] for i in r_idx)
+        if replay_d is not None:
+            replay_decks = [replay_d[i] for i in r_idx]
+            decks.extend(replay_decks)
+        else:
+            decks.extend(["replay"] * n_replay)
+        print(f"  Replay: mixed in {n_replay} samples from {args.replay_buffer}")
+        n = len(features)
+
+    # ── EWC anchor: load previous weights + Fisher ──
+    ewc_anchor, ewc_fisher, anchor_decks = None, None, None
+    if args.anchor:
+        ewc_anchor, ewc_fisher, anchor_decks = load_anchor(args.anchor)
+        print(f"  EWC anchor: {args.anchor} (λ={args.ewc_lambda}"
+              + (f", decks={anchor_decks}" if anchor_decks else "")
+              + ")")
 
     rng = np.random.default_rng(args.seed)
     perm = rng.permutation(n)
@@ -453,6 +516,7 @@ def main():
     val_idx, tr_idx = perm[:val_n], perm[val_n:]
     tr_f = [features[i] for i in tr_idx]
     tr_l = [labels[i]   for i in tr_idx]
+    tr_d = [decks[i]    for i in tr_idx]
     va_f = [features[i] for i in val_idx]
     va_l = [labels[i]   for i in val_idx]
     print(f"  Train: {len(tr_f)}  Val: {len(va_f)}")
@@ -467,9 +531,15 @@ def main():
     n_features = len(tr_f[0]) if tr_f else 19
     hidden_str = "→".join([str(args.hidden)] * args.depth)
     arch = f"{n_features}→{hidden_str}→24"
+    cl_tag = ""
+    if ewc_anchor is not None:
+        cl_tag += f", EWC λ={args.ewc_lambda}"
+    if args.replay_buffer:
+        cl_tag += f", replay {args.replay_frac:.0%}"
     print(f"Training ({arch}, {args.activation}, AdamW, patience={args.patience}"
           + (", class-weighted" if cw is not None else "")
           + (f", noise_std={args.noise_std}" if args.noise_std > 0 else "")
+          + cl_tag
           + ") ...")
     model = train(tr_f, tr_l, va_f, va_l,
                   epochs=args.epochs, lr_max=args.lr,
@@ -479,7 +549,10 @@ def main():
                   class_weights=cw,
                   noise_std=args.noise_std,
                   n_features=n_features,
-                  pretrained=args.pretrained)
+                  pretrained=args.pretrained,
+                  ewc_anchor=ewc_anchor,
+                  ewc_fisher=ewc_fisher,
+                  ewc_lambda=args.ewc_lambda if ewc_anchor else 0.0)
 
     if args.format == "kerasify":
         export_opm_kerasify(model, args.out)
@@ -489,6 +562,31 @@ def main():
     tr_acc = sum(model.predict(f) == l for f, l in zip(tr_f, tr_l)) / len(tr_f)
     va_acc = sum(model.predict(f) == l for f, l in zip(va_f, va_l)) / len(va_f)
     print(f"Final  train acc: {tr_acc:.3f}  val acc: {va_acc:.3f}")
+
+    # ── Continual learning: compute Fisher, save anchor + replay ──
+    if args.save_anchor:
+        def _grad_fn(f, l):
+            _, cache = model.forward(f)
+            _, grads = model.backward(cache, l)
+            return grads
+        new_fisher = compute_fisher_diagonal(
+            model._params(), _grad_fn, tr_f, tr_l,
+            n_samples=args.fisher_samples, seed=args.seed)
+        if ewc_fisher is not None:
+            merged = merge_fisher(ewc_fisher, new_fisher, decay=args.fisher_decay)
+        else:
+            merged = new_fisher
+        all_decks = sorted(set(decks))
+        save_anchor(model._params(), merged, args.save_anchor, decks=all_decks)
+        print(f"  Anchor + Fisher → {args.save_anchor} (decks: {all_decks})")
+
+    if args.save_replay:
+        sel_f, sel_l, sel_d = select_exemplars(
+            features, labels, decks=decks,
+            budget_per_deck=args.replay_budget, seed=args.seed)
+        save_replay_buffer(sel_f, sel_l, args.save_replay, decks=sel_d)
+        print(f"  Replay buffer → {args.save_replay} ({len(sel_f)} exemplars)")
+
     print(f"\nTo use:\n  export OPM_NEURAL_CPR_WEIGHTS={os.path.abspath(args.out)}")
 
 

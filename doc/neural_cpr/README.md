@@ -1,51 +1,49 @@
 # Neural CPR Policy
 
-A learned linear-solver configuration layer that replaces the static
-`--linear-solver=cprw` setting with a per-Newton-iteration decision,
-choosing the CPR preconditioner parameters that minimise total linear-solve
-time based on the current state of the simulator.
+Three complementary learned policies that replace or augment static CPR
+linear-solver settings with per-Newton-step decisions, trained from sweep
+data collected on benchmark reservoir decks.
 
 ---
 
-## Motivation
+## Policies
 
-OPM Flow's CPR (Constrained Pressure Residual) preconditioner exposes three
-independent axes of configuration:
-
-| Axis | Options | Effect |
+| Policy | Controls | Key env var |
 |---|---|---|
-| Pressure-decoupling | `quasiimpes`, `trueimpes`, `trueimpesanalytic` | Accuracy vs. cost of the pressure extraction weights |
-| Fine smoother | `paroverilu0`, `dilu` | ILU vs. decoupled-ILU before the coarse correction |
-| Coarse AMG smoother | `ilu0`, `dilu` | Smoother inside the AMG V-cycle |
-
-The standard approach picks one combination at startup and keeps it for the
-entire simulation.  But the difficulty of each linear solve changes
-continuously: the first Newton step of a timestep is structurally easy (the
-system is close to the previous solution), while later steps or rapid
-well-schedule changes can produce ill-conditioned systems that need the
-more accurate (and more expensive) `trueimpes` decoupling.
-
-The neural CPR policy adapts these three choices every time the solver is
-rebuilt, using eight lightweight features extracted from the current matrix
-and Newton state to predict which configuration minimises wall time.
+| **CPR variant** (neural-v3) | Which of 24 CPR configurations to use each Newton step | `OPM_NEURAL_CPR_WEIGHTS` |
+| **Neural AMG** | Prolongation damping and coarsening target at each CPR setup rebuild | `OPM_NEURAL_CPR_WEIGHTS` + `OPM_NEURAL_CPR_ACTIONS=amg` |
+| **Neural abort** | Whether to give up on a timestep attempt likely to be chopped | `OPM_CPR_ABORT_MODEL` |
 
 ---
 
 ## Architecture
 
+### CPR variant
+
 ```
 simulator state  ──┐
-                   ├──► NeuralCPRFeatures ──► NeuralCPRPolicy ──► CPRConfig
-assembled matrix ──┘          (8 features)        (MLP / rules)
+                   ├──► NeuralCPRFeatures (12–19 features) ──► NeuralCPRPolicy ──► CPRConfig (label 0–23)
+assembled matrix ──┘
 
-CPRConfig ──► NeuralCPRPolicy::configToPropertyTree()
-          ──► prm_[activeSolverNum_]          (in-place update)
-          ──► FlexibleSolver::create()        (existing OPM path)
+label = dec*8 + cprw*4 + fine*2 + coarse
+  dec   : 0=quasiimpes  1=trueimpes  2=trueimpesanalytic
+  cprw  : 0=cpr         1=cprw
+  fine  : 0=paroverilu0 1=dilu
+  coarse: 0=ilu0        1=dilu
 ```
 
-The hook lives inside `ISTLSolver::prepare()`, between the existing
-`initPrepare()` and `prepareFlexibleSolver()` calls.  No changes to any
-other part of the simulation pipeline are required.
+MLP: `N → H → 24` (N = 12 core features, up to 19 with extended columns;
+H = best of {8,12,16,24,32} from architecture search; depth 1 or 2).
+
+### Neural AMG
+
+MLP: `12 → H → 9` (3 dampings × 3 coarsening targets). Outputs are negated
+log costs; argmax picks the cheapest predicted combination.
+
+### Neural abort
+
+MLP: `14 → H → 1` (sigmoid). Predicts P(chop) at each Newton iteration.
+Input standardisation is folded into the first layer at export time.
 
 ---
 
@@ -53,28 +51,67 @@ other part of the simulation pipeline are required.
 
 | File | Role |
 |---|---|
-| `opm/simulators/linalg/NeuralCprFeatures.hpp` | Feature struct + normalisation |
-| `opm/simulators/linalg/NeuralCprPolicy.hpp` | MLP, rule-based fallback, PropertyTree builder |
-| `opm/simulators/linalg/ISTLSolver.hpp` | Integration hook + caching |
+| `opm/simulators/linalg/NeuralCprFeatures.hpp` | Feature struct + normalisation (12–19 features) |
+| `opm/simulators/linalg/NeuralCprPolicy.hpp` | CPR variant MLP, AMG policy, rule-based fallback, PropertyTree builder |
+| `opm/simulators/linalg/NeuralAbortPolicy.hpp` | Early-abort policy |
+| `opm/simulators/linalg/ISTLSolver.hpp` | Integration hooks + three-tier caching |
 | `CMakeLists_files.cmake` | Header registration |
 
-Detailed documentation for each module:
+Detailed documentation:
 
 - [NeuralCPRFeatures](NeuralCPRFeatures.md)
 - [NeuralCPRPolicy](NeuralCPRPolicy.md)
 - [ISTLSolver integration](ISTLSolver_integration.md)
+- [Continual learning](CONTINUAL_LEARNING_README.md)
 
 ---
 
 ## Quick start
 
-### Default mode (rule-based fallback, zero overhead)
-
-No arguments needed.  The policy activates automatically and uses the
-rule-based heuristic when no weights file is present:
+### CPR variant policy
 
 ```bash
-flow --linear-solver=cprw DECK.DATA
+export OPM_NEURAL_CPR_WEIGHTS=/path/to/cpr_policy.model
+flow DECK.DATA
+```
+
+### Neural AMG policy (on Flow's default CPR reuse)
+
+```bash
+export OPM_NEURAL_CPR_WEIGHTS=/path/to/cpr_amg_policy.model
+export OPM_NEURAL_CPR_ACTIONS=amg
+export OPM_NEURAL_CPR_MIN_GAIN=0.05
+flow DECK.DATA
+```
+
+### Neural abort policy
+
+```bash
+export OPM_CPR_ABORT_MODEL=/path/to/abort.model
+export OPM_CPR_ABORT_THRESHOLD=0.95
+flow DECK.DATA
+```
+
+### All three combined
+
+```bash
+export OPM_NEURAL_CPR_WEIGHTS=/path/to/cpr_policy.model
+export OPM_CPR_ABORT_MODEL=/path/to/abort.model
+export OPM_CPR_ABORT_THRESHOLD=0.95
+flow DECK.DATA
+```
+
+### CPR variant with setup reuse
+
+```bash
+export OPM_NEURAL_CPR_WEIGHTS=/path/to/cpr_policy.model
+flow --cpr-reuse-setup=4 --cpr-reuse-interval=10 DECK.DATA
+```
+
+### Rule-based fallback (no model file, zero overhead)
+
+```bash
+flow DECK.DATA
 ```
 
 The `.DBG` log will show one line per solver rebuild:
@@ -82,67 +119,55 @@ The `.DBG` log will show one line per solver rebuild:
 ```
 NeuralCPRPolicy: active (rule-based fallback)
 NeuralCPRPolicy: cprw weight=quasiimpes fine=paroverilu0 coarse=ilu0
-NeuralCPRPolicy: cprw weight=trueimpes fine=dilu coarse=ilu0
-```
-
-### With trained MLP weights
-
-```bash
-export OPM_NEURAL_CPR_WEIGHTS=/path/to/weights.bin
-flow --linear-solver=cprw DECK.DATA
-```
-
-The binary weight file format is documented in [NeuralCPRPolicy](NeuralCPRPolicy.md#weight-file-format).
-
-### Experimental: rebuild AMG on every Newton step
-
-Forces the policy to be evaluated at every Newton iteration instead of
-only on the first one per timestep.  Reduces linear iterations but
-increases setup overhead; useful for training-data collection:
-
-```bash
-OPM_NEURAL_CPR_WEIGHTS=/path/to/weights.bin \
-  flow --linear-solver=cprw --cpr-reuse-setup=0 DECK.DATA
 ```
 
 ---
 
-## Benchmark results
+## Training pipeline
 
-Tested with the `bikagit/opm-simulators` build against OPM test cases.
+```
+# Step 0 — collect sweep data (hours of flow runs)
+python run_sweep.py --flow ./flow --out cpr_sweep_data/ \
+    --decks norne/NORNE.DATA spe9/SPE9.DATA
 
-### SPE9 (9,000 cells, 329 linearizations)
+# Step 1 — label: pick best config per solve
+python collect_sweep_labels.py \
+    --csvs cpr_sweep_data/**/*.csv --out training_data.csv
 
-| Configuration | Sim time | Linear setup | Linear iters |
-|---|---|---|---|
-| Baseline `cprw` (static trueimpes) | 6.55 s | 1.34 s | 481 |
-| Neural policy, default reuse | 6.56 s | 1.34 s | 481 |
-| Neural policy, `--cpr-reuse-setup=0` | 9.22 s | 4.19 s | **418 (−13%)** |
+# Step 2 — (optional) pre-train encoder
+python pretrain_cpr_policy.py \
+    --csvs cpr_sweep_data/**/*.csv --out encoder.npz --hidden 24
 
-### Norne (45,217 cells, 1,333 Newton iterations)
+# Step 2 — train CPR variant policy
+python train_cpr_policy.py \
+    --data training_data.csv --out cpr_policy.model \
+    --hidden 32 --epochs 200 --pretrained encoder.npz
 
-| Configuration | Sim time | Linear setup | Linear iters |
-|---|---|---|---|
-| Baseline `cprw` (static trueimpes) | 185.1 s | 26.6 s | 2452 |
-| Neural policy, default reuse | 184.5 s | 26.8 s | 2452 |
+# AMG policy (separate sweep with run_amg_sweep.py)
+python train_cpr_amg_policy.py \
+    --csvs amg_sweep/**/*.csv --out cpr_amg_policy.model
 
-**Key findings:**
+# Abort policy (from sweep .DBG logs)
+python train_abort_policy.py \
+    --train sweep_run1/**/*.DBG --out abort.model
+```
 
-- In default reuse mode the neural policy adds **zero measurable overhead**
-  (three-tier caching eliminates all redundant work when the config is stable).
-- With `--cpr-reuse-setup=0` the rule-based policy already reduces linear
-  iterations by 13% on SPE9 by selecting `quasiimpes` on the first Newton
-  step of each timestep, where the cheaper weight computation does not
-  compromise solver quality.
-- The full benefit of trained MLP weights will emerge on larger, more
-  heterogeneous cases where the optimal config varies significantly across
-  timesteps.
+All training scripts are pure NumPy; no PyTorch or TensorFlow required.
+Continual learning (EWC + replay buffers) is available in all three scripts —
+see [CONTINUAL_LEARNING_README.md](CONTINUAL_LEARNING_README.md).
 
 ---
 
-## Training pipeline (Python)
+## Environment variables
 
-See the companion training script outline in [NeuralCPRPolicy](NeuralCPRPolicy.md#training-pipeline).
-The data-collection sweep uses the existing `--linear-solver=cpr_trueimpes`,
-`--linear-solver=cpr_quasiimpes`, and `--linear-solver=cprw` flags to evaluate
-all config combinations on benchmark decks.  Labels are wall-time-per-linear-solve.
+| Variable | Default | Effect |
+|---|---|---|
+| `OPM_NEURAL_CPR_WEIGHTS` | unset | Path to CPR variant or AMG model |
+| `OPM_NEURAL_CPR_ACTIONS` | `variant` | `variant` or `amg` |
+| `OPM_NEURAL_CPR_MIN_GAIN` | `0.05` | AMG policy: min log-cost gain to switch |
+| `OPM_NEURAL_CPR_CONFIDENCE` | `0.6` | CPR variant: softmax confidence to switch |
+| `OPM_NEURAL_CPR_FORBID_LABELS` | unset | Comma-separated labels to exclude (e.g. `16,17,18,19,20,21,22,23` for SPE11) |
+| `OPM_NEURAL_CPR_DISABLE` | unset | `1` to disable CPR variant (abort-only mode) |
+| `OPM_CPR_ABORT_MODEL` | unset | Path to abort policy model |
+| `OPM_CPR_ABORT_THRESHOLD` | `0.95` | Abort: probability threshold to give up |
+| `OPM_CPR_SWEEP_LOG` | unset | Per-Newton CSV written during sweep data collection |

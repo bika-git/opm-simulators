@@ -29,6 +29,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_cpr_cost import forward, iter_rows, modelled_ms, pack_ensemble  # noqa: E402
 from train_cpr_policy import MLP, normalise, export_binary_fallback  # noqa: E402
+from continual import (save_anchor, load_anchor, merge_fisher,  # noqa: E402
+                       save_replay_buffer, load_replay_buffer)
 
 DAMPING = [1.0, 1.3, 1.6]
 TARGET = [1200, 600, 300]
@@ -71,7 +73,8 @@ def load_windows(paths):
 
 
 def train(X, di, ti, y, w, Xv, dv, tv, yv, wv, hidden, depth, epochs, lr, batch,
-          seed, patience, additive):
+          seed, patience, additive,
+          ewc_anchor=None, ewc_fisher=None, ewc_lambda=0.0):
     n_out = len(DAMPING) + len(TARGET) if additive else len(DAMPING) * len(TARGET)
     mlp = MLP(hidden=hidden, activation="relu", seed=seed, n_features=N_FEAT, depth=depth)
     mlp.weights[-1] = mlp.weights[-1][:n_out].copy()
@@ -85,6 +88,7 @@ def train(X, di, ti, y, w, Xv, dv, tv, yv, wv, hidden, depth, epochs, lr, batch,
                 sel = (di == d) & (ti == t)
                 bs[-1][slots(d, t, False)[0]] = y[sel].mean() if sel.any() else y.mean()
     params = Ws + bs
+    pnames = [f"W{i}" for i in range(len(Ws))] + [f"b{i}" for i in range(len(bs))]
     m_ = [np.zeros_like(p) for p in params]
     v_ = [np.zeros_like(p) for p in params]
     rng = np.random.default_rng(seed)
@@ -112,8 +116,14 @@ def train(X, di, ti, y, w, Xv, dv, tv, yv, wv, hidden, depth, epochs, lr, batch,
                 gW[i], gb[i] = g.T @ hs[i], g.sum(0)
                 if i > 0:
                     g = (g @ Ws[i]) * (hs[i] > 0)
+            # EWC penalty: add λ * F_i * (θ_i - θ*_i) to each gradient
+            all_grads = gW + gb
+            if ewc_anchor is not None and ewc_lambda > 0:
+                for j, name in enumerate(pnames):
+                    if name in ewc_anchor and name in ewc_fisher:
+                        all_grads[j] = all_grads[j] + ewc_lambda * ewc_fisher[name] * (params[j] - ewc_anchor[name])
             t += 1
-            for j, (p, gr) in enumerate(zip(params, gW + gb)):
+            for j, (p, gr) in enumerate(zip(params, all_grads)):
                 m_[j] = 0.9 * m_[j] + 0.1 * gr
                 v_[j] = 0.999 * v_[j] + 0.001 * gr * gr
                 p -= lr_ep * ((m_[j] / (1 - 0.9 ** t)) / (np.sqrt(v_[j] / (1 - 0.999 ** t)) + 1e-8)
@@ -149,11 +159,52 @@ def main():
     ap.add_argument("--additive", action="store_true",
                     help="One output per parameter level instead of per combination")
     ap.add_argument("--seed", type=int, default=42)
+
+    # ── Continual learning ──
+    cl = ap.add_argument_group("continual learning")
+    cl.add_argument("--anchor", default=None,
+                    help="Anchor .npz from previous training (enables EWC)")
+    cl.add_argument("--ewc-lambda", type=float, default=1.0,
+                    help="EWC penalty strength (default 1.0)")
+    cl.add_argument("--replay-buffer", default=None,
+                    help="Replay buffer .npz — old windows mixed into training")
+    cl.add_argument("--replay-frac", type=float, default=0.5,
+                    help="Replay windows as fraction of new data (default 0.5)")
+    cl.add_argument("--save-anchor", default=None,
+                    help="Save anchor + Fisher to .npz after training")
+    cl.add_argument("--save-replay", default=None,
+                    help="Save replay buffer to .npz after training")
+    cl.add_argument("--fisher-decay", type=float, default=0.9,
+                    help="EMA decay for merging Fisher diagonals (default 0.9)")
     args = ap.parse_args()
 
     X, di, ti, y, deck, grp = load_windows(args.csvs)
     print(f"{len(y)} reuse windows from {len(args.csvs)} runs: "
           f"{dict(Counter(deck.tolist()))}")
+
+    # ── Replay: mix old windows into training data ──
+    if args.replay_buffer:
+        rdata = np.load(args.replay_buffer, allow_pickle=True)
+        n_avail = len(rdata["y"])
+        n_replay = min(int(len(y) * args.replay_frac), n_avail)
+        rng_r = np.random.default_rng(args.seed)
+        r_idx = rng_r.choice(n_avail, n_replay, replace=False)
+        X = np.vstack([X, rdata["X"][r_idx]])
+        di = np.concatenate([di, rdata["di"][r_idx]])
+        ti = np.concatenate([ti, rdata["ti"][r_idx]])
+        y = np.concatenate([y, rdata["y"][r_idx]])
+        deck = np.concatenate([deck, rdata["deck"][r_idx]])
+        grp = grp + [tuple(g) for g in rdata["grp"][r_idx]]
+        print(f"  Replay: mixed in {n_replay} windows from {args.replay_buffer}")
+
+    # ── EWC anchor ──
+    ewc_anchor, ewc_fisher = None, None
+    if args.anchor:
+        ewc_anchor, ewc_fisher, anchor_decks = load_anchor(args.anchor)
+        print(f"  EWC anchor: {args.anchor} (λ={args.ewc_lambda}"
+              + (f", decks={anchor_decks}" if anchor_decks else "")
+              + ")")
+
     names, inv, counts = np.unique(deck, return_inverse=True, return_counts=True)
     w = (len(deck) / (len(names) * counts))[inv].astype(np.float32)   # decks weigh equally
 
@@ -172,7 +223,9 @@ def main():
         members.append(train(X[idx], di[idx], ti[idx], y[idx], w[idx], X[is_val], di[is_val],
                              ti[is_val], y[is_val], w[is_val], args.hidden, args.depth,
                              args.epochs, args.lr, args.batch, args.seed + j, args.patience,
-                             args.additive))
+                             args.additive,
+                             ewc_anchor=ewc_anchor, ewc_fisher=ewc_fisher,
+                             ewc_lambda=args.ewc_lambda if ewc_anchor else 0.0))
     mlp = members[0] if args.ensemble == 1 else pack_ensemble(members, args.hidden, args.depth)
 
     # Offline check of the anchored rule on held-out windows of the default
@@ -206,6 +259,41 @@ def main():
             top = Counter(f"pd{DAMPING[combos[k][0]]}/ct{TARGET[combos[k][1]]}" for k in pick)
             print(f"  margin {m:4.2f}: priced cost {100 * cost:+5.1f}%  picks "
                   f"{dict(top.most_common(3))}")
+
+    # ── Save anchor + Fisher from member 0 (before negation) ──
+    if args.save_anchor:
+        m0 = members[0]
+        m0_params = {f"W{i}": m0.weights[i] for i in range(len(m0.weights))}
+        m0_params.update({f"b{i}": m0.biases[i] for i in range(len(m0.biases))})
+        # Approximate Fisher via MSE gradient on training windows
+        n_fisher = min(1000, len(tr))
+        fisher_dict: dict[str, np.ndarray] = {k: np.zeros_like(v) for k, v in m0_params.items()}
+        for fi in range(n_fisher):
+            ii = tr[fi]
+            out_1, hs_1 = forward(m0.weights, m0.biases, X[ii:ii+1])
+            err_1 = float(sum(out_1[0, k] for k in slots(di[ii], ti[ii], args.additive)) - y[ii])
+            g_out = np.zeros_like(out_1)
+            for c_idx in slots(di[ii], ti[ii], args.additive):
+                g_out[0, c_idx] += 2 * err_1
+            for layer_i in range(len(m0.weights) - 1, -1, -1):
+                gW_f = g_out.T @ hs_1[layer_i]
+                gb_f = g_out.sum(0)
+                fisher_dict[f"W{layer_i}"] += gW_f ** 2 / n_fisher
+                fisher_dict[f"b{layer_i}"] += gb_f ** 2 / n_fisher
+                if layer_i > 0:
+                    g_out = (g_out @ m0.weights[layer_i]) * (hs_1[layer_i] > 0)
+        if ewc_fisher is not None:
+            fisher_dict = merge_fisher(ewc_fisher, fisher_dict, decay=args.fisher_decay)
+        all_decks = sorted(set(deck.tolist()))
+        save_anchor(m0_params, fisher_dict, args.save_anchor, decks=all_decks)
+        print(f"  Anchor + Fisher → {args.save_anchor} (decks: {all_decks})")
+
+    # ── Save replay buffer ──
+    if args.save_replay:
+        np.savez(args.save_replay,
+                 X=X, di=di, ti=ti, y=y, deck=deck,
+                 grp=np.array(grp, dtype=object))
+        print(f"  Replay buffer → {args.save_replay} ({len(y)} windows)")
 
     mlp.weights[-1] *= -1.0
     mlp.biases[-1] *= -1.0

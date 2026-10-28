@@ -6,108 +6,99 @@
 
 ## Purpose
 
-`NeuralCPRFeatures` is a plain data struct that captures eight scalar
-quantities describing the current state of the nonlinear solver at the
-moment `ISTLSolver::prepare()` is called.  Its only method,
-`toInputVector()`, normalises these quantities to a uniform `[0, 1]` range
-suitable for MLP inference.
-
-The struct deliberately has no dependencies beyond the standard library so
-it can be included anywhere in the solver stack without pulling in OPM
-headers.
+`NeuralCPRFeatures` is a plain data struct that captures scalar quantities
+describing the current state of the nonlinear solver at the moment
+`ISTLSolver::prepare()` is called. Its `toInputVector()` method normalises
+these to a `[0, 1]` range suitable for MLP inference.
 
 ---
 
-## The eight features
+## CPR variant policy features
 
-| Index | Field | Unit | Description |
+The CPR variant policy (`train_cpr_policy.py`) uses up to 19 features. The
+first 12 are the **core** columns always present in sweep CSVs; the remaining
+7 are **extended** columns added later (older CSVs default them to 0).
+
+### Core features (indices 0–11)
+
+| Index | Field | Normalisation | Description |
 |---|---|---|---|
-| 0 | `dt_days` | days | Current timestep length |
-| 1 | `dt_ratio` | — | `dt / dt_prev`; 1.0 on the first step |
-| 2 | `nl_residual_norm` | — | L2 norm of the assembled right-hand side |
-| 3 | `nl_residual_reduce` | — | `norm / norm_at_Newton_iter_0` for this timestep |
-| 4 | `nl_iteration` | — | Newton iteration index (0-based) |
-| 5 | `nnz_per_row` | — | Average non-zeros per block row |
-| 6 | `diag_dominance` | — | Mean `‖a_ii‖_F / Σ_{j≠i} ‖a_ij‖_F` over 200 sampled rows |
-| 7 | `pad` | — | Reserved, always 0 |
+| 0 | `dt_days` | `log1p(x) / 7` | Current timestep length in days |
+| 1 | `dt_ratio` | `clip(x / 10, 0, 1)` | `dt / dt_prev`; 1.0 on the first step |
+| 2 | `nl_residual_norm` | `(log10(max(x,1e-14)) + 14) / 14` | L2 norm of the assembled right-hand side |
+| 3 | `nl_residual_reduce` | `clip(x, 0, 1)` | `norm / norm_at_Newton_iter_0` |
+| 4 | `nl_iteration` | `clip(x / 20, 0, 1)` | Newton iteration index (0-based) |
+| 5 | `nnz_per_row` | `log1p(x) / 5` | Average non-zeros per block row |
+| 6 | `diag_dominance` | `clip(x / 4, 0, 1)` | Mean `‖a_ii‖_F / Σ_{j≠i} ‖a_ij‖_F` over 200 sampled rows |
+| 7 | `prev_linsolver_iters` | `clip(x / 50, 0, 1)` | Linear iterations in the previous Newton step |
+| 8 | `prev_solve_failed` | `clip(x, 0, 1)` | 1 if the previous linear solve failed to converge |
+| 9 | `time_elapsed_frac` | `clip(x, 0, 1)` | Fraction of total simulation time elapsed |
+| 10 | `num_cells_log` | `clip(x / 6, 0, 1)` | `log10(num_cells)` (e.g. 5 → 100k cells) |
+| 11 | `block_size` | `clip(x / 6, 0, 1)` | Number of equations per cell (3 = oil/gas/water) |
 
-### Feature rationale
+### Extended features (indices 12–18, default 0 for old CSVs)
 
-**`dt_days` (log-scaled):** Large timesteps produce stiffer Jacobians that
-require more robust (expensive) decoupling strategies.  The logarithmic
-scale compresses the dynamic range; reservoir timesteps span four orders of
-magnitude.
+| Index | Field | Normalisation | Description |
+|---|---|---|---|
+| 12 | `well_density` | `clip(x * 200, 0, 1)` | Fraction of cells that are well connections |
+| 13 | `nl_residual_trend` | `clip((log10(max(x,0.01)) + 2) / 4, 0, 1)` | Ratio of current to previous residual norm (convergence rate) |
+| 14 | `num_phases` | `clip(x / 3, 0, 1)` | Number of active fluid phases |
+| 15 | `dt_cut_count` | `clip(x / 5, 0, 1)` | Number of consecutive timestep cuts |
+| 16 | `prev2_linsolver_iters` | `clip(x / 50, 0, 1)` | Linear iterations two Newton steps ago |
+| 17 | `condition_number_estimate` | `clip(log10(max(x,1)) / 10, 0, 1)` | Estimated matrix condition number |
+| 18 | `bhp_well_fraction` | `clip(x, 0, 1)` | Fraction of wells on BHP control |
 
-**`dt_ratio`:** A sudden increase in stepsize (ratio ≫ 1) is a reliable
-predictor of a harder solve.  A ratio < 1 (timestep cut after a failed step)
-signals that the previous configuration was insufficient.
+### Feature rationale (selected)
 
-**`nl_residual_norm`:** The raw norm distinguishes initial linearisations
-(high norm, problem easy) from later Newton steps (low norm, near-convergence,
-problem may be ill-conditioned).
+**`dt_days` (log-scaled):** Large timesteps produce stiffer Jacobians. The
+log scale compresses a dynamic range spanning four orders of magnitude.
 
-**`nl_residual_reduce`:** The reduction ratio tracks Newton convergence rate
-within a timestep.  A ratio close to 1 (residual barely decreasing) is the
-strongest single predictor that a more robust solver configuration is needed.
+**`dt_ratio`:** A sudden increase (ratio ≫ 1) predicts a harder solve. A
+ratio < 1 signals a recent timestep cut.
 
-**`nl_iteration`:** Directly encodes how many Newton steps have already been
-taken.  Early steps tolerate cheaper configs; repeated attempts indicate difficulty.
+**`nl_residual_reduce`:** Ratio close to 1 (residual barely decreasing) is
+the strongest single predictor that a more robust solver config is needed.
 
-**`nnz_per_row`:** Captures problem connectivity.  Highly connected systems
-(e.g., corner-point grids with many active neighbours) form denser Jacobians
-where AMG smoother choice matters more.  Constant throughout a simulation;
-cached after the first call.
+**`prev_linsolver_iters`:** High iteration count on the previous step signals
+that the system is approaching the solver's convergence limit.
 
-**`diag_dominance`:** The ratio of diagonal-block Frobenius norm to the sum
-of off-diagonal norms indicates how well the pressure subsystem is separated
-from the saturation equations.  Low dominance → `trueimpes` decoupling helps
-more.  Recomputed only on Newton iteration 0 of each timestep.
+**`diag_dominance`:** Low dominance → `trueimpes` decoupling helps more.
+Recomputed only on Newton iteration 0 of each timestep.
 
-**`pad`:** Placeholder for a future feature (e.g., well density) without
-changing the MLP input dimension.
+**`nnz_per_row`:** Captures grid connectivity; constant throughout a
+simulation, cached after the first call.
 
 ---
 
-## Normalisation (`toInputVector`)
+## AMG policy features
 
-All eight slots are mapped to roughly `[0, 1]` before feeding the MLP:
+The AMG policy (`train_cpr_amg_policy.py`) uses the first 12 core features
+above (`N_FEAT = 12`), evaluated at CPR setup rebuild points.
 
-```
-x[0] = log1p(dt_days) / 7.0
-x[1] = clamp(dt_ratio / 10.0,  0, 1)
-x[2] = (log10(max(norm, 1e-14)) + 14.0) / 14.0   # maps [-14,0] → [0,1]
-x[3] = clamp(nl_residual_reduce, 0, 1)
-x[4] = clamp(nl_iteration / 20.0, 0, 1)
-x[5] = log1p(nnz_per_row) / 5.0
-x[6] = clamp(diag_dominance / 4.0, 0, 1)
-x[7] = 0.0
-```
+---
 
-The log transforms handle the wide dynamic ranges typical in reservoir
-simulation without requiring per-run standardisation.
+## Abort policy features
+
+The abort policy (`train_abort_policy.py`) uses 14 features extracted from
+the Newton convergence report and the CPR solver's own state. These are what
+the linear solver itself can observe at each Newton step:
+
+| Group | Features |
+|---|---|
+| `SOLVER_KNOWN` (5) | `iteration`, `after_chop`, `chop_streak`, `dt_change`, `prev_iters` |
+| `CPR_FEATURES` (4) | `last_lin_its`, `max_lin_its`, `setup_age`, `rebuilt_now` |
+| `RES_FEATURES` (5) | `log_res`, `res_vs_start`, `res_step`, `res_vs_best`, `res_frac_up` |
+
+Input standardisation `(x − μ) / σ` is folded into the first weight matrix
+at export time, so Flow feeds raw (un-normalised) values.
 
 ---
 
 ## Caching behaviour (inside ISTLSolver)
 
-Two features are cached across calls to avoid redundant computation:
-
 | Feature | Cache policy | Justification |
 |---|---|---|
 | `nnz_per_row` | Permanent — computed once | Sparsity pattern never changes |
-| `diag_dominance` | Per-timestep — recomputed when `nl_iteration == 0` | Computation is O(200 rows); values change slowly across Newton steps |
-
-`nl_residual_norm`, `nl_residual_reduce`, and `nl_iteration` are cheap to
-compute (L2 norm of the rhs vector + two lookups) and always reflect the
-current Newton state, so they are never cached.
-
----
-
-## Adding a new feature
-
-1. Add a new field to `NeuralCPRFeatures` with a sensible default.
-2. Update `toInputVector()` — shift the new value into an existing slot or
-   replace `pad`.  Keep the output dimension at 8 to avoid changing the MLP
-   weight shapes.
-3. Update `ISTLSolver::extractFeatures()` to populate the field.
-4. Retrain the MLP with data collected using the updated features.
+| `diag_dominance` | Per-timestep — refreshed when `nl_iteration == 0` | O(200 rows); changes slowly across Newton steps |
+| `num_cells_log`, `block_size` | Permanent — from grid metadata | Grid and physics are fixed |
+| All others | Live — read each call | Cheap or must reflect current state |
