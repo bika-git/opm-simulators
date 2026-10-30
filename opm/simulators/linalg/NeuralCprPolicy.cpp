@@ -88,7 +88,7 @@ NeuralCprPolicy::NeuralCprPolicy(const std::string& model_path)
     } catch (const std::exception& e) {
         OpmLog::warning("NeuralCprPolicy: failed to load model from '"
                         + model_path + "': " + std::string(e.what())
-                        + " — using rule-based fallback");
+                        + " — the policy stays off");
         valid_ = false;
         return;
     }
@@ -104,7 +104,7 @@ NeuralCprPolicy::NeuralCprPolicy(const std::string& model_path)
         if (model_input_size_ > nf) {
             OpmLog::warning("NeuralCprPolicy: model expects " + std::to_string(model_input_size_)
                             + " features but binary only provides " + std::to_string(nf)
-                            + " — using rule-based fallback");
+                            + " — the policy stays off");
             valid_ = false;
         }
     }
@@ -139,13 +139,13 @@ bool NeuralCprPolicy::scores(const CprPolicyFeatures& feat,
     return true;
 }
 
-CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
-                                          float* out_confidence) const
+std::optional<CprPolicyAction> NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
+                                                         float* out_confidence) const
 {
     std::vector<float> out;
     if (!scores(feat, out)) {
-        if (out_confidence) *out_confidence = 1.0f;
-        return ruleBasedPredict(feat);
+        if (out_confidence) *out_confidence = 0.0f;
+        return std::nullopt;
     }
 
     if (out_confidence) {

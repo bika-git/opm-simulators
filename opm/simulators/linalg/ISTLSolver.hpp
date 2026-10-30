@@ -59,12 +59,15 @@
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/simulators/linalg/CprPolicyFeatures.hpp>
 #include <opm/simulators/linalg/NeuralAbortPolicy.hpp>
+#include <opm/simulators/linalg/NeuralEwGate.hpp>
 #include <opm/simulators/linalg/NeuralCprPolicy.hpp>
 
 #include <fmt/format.h>
 
 #include <any>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstddef>
 #include <fstream>
@@ -337,6 +340,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
             initNeuralPolicy();
             initAbortPolicy();
+            initEisenstatWalker();
         }
 
         // Drop the cached matrix pointer so initPrepare() sees the next matrix
@@ -359,10 +363,11 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
         /// Load the neural CPR policy from $OPM_NEURAL_CPR_WEIGHTS (if set).
         /// Also opens the sweep log file if OPM_CPR_SWEEP_LOG is set.
+        /// Without a usable model there is no policy at all, so flow keeps the
+        /// upstream solver configuration untouched.
         void initNeuralPolicy()
         {
-            // Explicit baseline mode: retain the upstream property tree and
-            // bypass both trained predictions and the rule-based fallback.
+            // Explicit baseline mode: retain the upstream property tree.
             const char* disabled = std::getenv("OPM_NEURAL_CPR_DISABLE");
             if (disabled && std::string(disabled) == "1") {
                 neural_policy_.reset();
@@ -370,9 +375,58 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                     OpmLog::info("NeuralCprPolicy: disabled (upstream solver defaults)");
                 return;
             }
-            const char* path = std::getenv("OPM_NEURAL_CPR_WEIGHTS");
-            neural_policy_ = std::make_unique<NeuralCprPolicy>(path ? path : "");
             const bool rank0 = (simulator_.gridView().comm().rank() == 0);
+
+            const char* log_path = std::getenv("OPM_CPR_SWEEP_LOG");
+            // Sweep mode must be decided identically on every rank: prepare()
+            // branches on it, and both branches contain collectives
+            // (extractFeatures / applyNeuralPolicy).  Only rank 0 owns the file.
+            sweep_mode_ = (log_path != nullptr);
+            if (log_path && rank0) {
+                sweep_log_ = std::make_unique<std::ofstream>(
+                    log_path, std::ios::app);
+                if (sweep_log_->is_open() && sweep_log_->tellp() == 0) {
+                    *sweep_log_
+                        << "config,episode,newton_iter,total_ms,"
+                           "dt_days,dt_ratio,nl_residual_norm,nl_residual_reduce,"
+                           "nl_iteration,nnz_per_row,diag_dominance,"
+                           "prev_linsolver_iters,prev_solve_failed,"
+                           "time_elapsed_frac,num_cells_log,block_size,"
+                           "setup_rebuilt,setup_ms,solve_ms\n";
+                           // "well_density,nl_residual_trend,"
+                           // "num_phases,dt_cut_count,prev2_linsolver_iters,"
+                           // "condition_number_estimate,bhp_well_fraction\n";
+                }
+                OpmLog::info("NeuralCprPolicy: sweep logging to "
+                             + std::string(log_path));
+            }
+
+            const char* path = std::getenv("OPM_NEURAL_CPR_WEIGHTS");
+            const char* rule_env = std::getenv("OPM_NEURAL_CPR_RULE");
+            rule_mode_ = rule_env && std::string(rule_env) == "1";
+            if (rule_mode_ && !(path && !std::string(path).empty())) {
+                // OPM_NEURAL_CPR_RULE=1 without a model: the deterministic CPR
+                // schedule (NeuralCprPolicy::ruleBasedPredict) decides at each
+                // setup rebuild; same decision path and broadcast as a model.
+                neural_policy_ = std::make_unique<NeuralCprPolicy>("");
+                if (rank0)
+                    OpmLog::info("NeuralCprPolicy: rule-based CPR schedule (OPM_NEURAL_CPR_RULE=1)");
+                return;
+            }
+            rule_mode_ = false;
+            if (!path || std::string(path).empty())
+                return;  // not requested: upstream solver, untouched
+            neural_policy_ = std::make_unique<NeuralCprPolicy>(path);
+            // All ranks must agree: prepare() runs collectives only when the
+            // policy exists.
+            const int loaded = simulator_.gridView().comm().min(neural_policy_->isLoaded() ? 1 : 0);
+            if (!loaded) {
+                neural_policy_.reset();
+                if (rank0)
+                    OpmLog::warning("NeuralCprPolicy: no usable model in '" + std::string(path)
+                                    + "' - keeping the upstream solver configuration");
+                return;
+            }
 
             // Minimum softmax probability required before switching configs.
             // Below threshold the current config is reused, avoiding rebuilds
@@ -465,39 +519,11 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                                  "coarsening target, min gain " + std::to_string(min_gain_));
             }
 
-            if (rank0) {
-                if (neural_policy_->isLoaded())
-                    OpmLog::info("NeuralCprPolicy: loaded model from "
-                                 + std::string(path)
-                                 + " (confidence threshold "
-                                 + std::to_string(confidence_threshold_) + ")");
-                else
-                    OpmLog::info("NeuralCprPolicy: active (rule-based fallback)");
-            }
-
-            const char* log_path = std::getenv("OPM_CPR_SWEEP_LOG");
-            // Sweep mode must be decided identically on every rank: prepare()
-            // branches on it, and both branches contain collectives
-            // (extractFeatures / applyNeuralPolicy).  Only rank 0 owns the file.
-            sweep_mode_ = (log_path != nullptr);
-            if (log_path && rank0) {
-                sweep_log_ = std::make_unique<std::ofstream>(
-                    log_path, std::ios::app);
-                if (sweep_log_->is_open() && sweep_log_->tellp() == 0) {
-                    *sweep_log_
-                        << "config,episode,newton_iter,total_ms,"
-                           "dt_days,dt_ratio,nl_residual_norm,nl_residual_reduce,"
-                           "nl_iteration,nnz_per_row,diag_dominance,"
-                           "prev_linsolver_iters,prev_solve_failed,"
-                           "time_elapsed_frac,num_cells_log,block_size,"
-                           "setup_rebuilt,setup_ms,solve_ms\n";
-                           // "well_density,nl_residual_trend,"
-                           // "num_phases,dt_cut_count,prev2_linsolver_iters,"
-                           // "condition_number_estimate,bhp_well_fraction\n";
-                }
-                OpmLog::info("NeuralCprPolicy: sweep logging to "
-                             + std::string(log_path));
-            }
+            if (rank0)
+                OpmLog::info("NeuralCprPolicy: loaded model from "
+                             + std::string(path)
+                             + " (confidence threshold "
+                             + std::to_string(confidence_threshold_) + ")");
         }
 
         /// OPM_CPR_ABORT_MODEL=path enables the neural early-abort policy, and
@@ -618,6 +644,190 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                               + std::to_string(simulator_.problem().iterationContext().iteration())
                               + " (p=" + std::to_string(p) + ")");
             return abort != 0;
+        }
+
+        /// OPM_EW=1 enables Eisenstat-Walker forcing terms for the linear
+        /// tolerance (see ewReduction()).  Off by default and off for NLDD
+        /// local solvers; when off, solve() calls the solver exactly as
+        /// upstream.  Tuning: OPM_EW_GAMMA (0.9), OPM_EW_ALPHA (2),
+        /// OPM_EW_MAX (0.1, also used for an attempt's first solve),
+        /// OPM_EW_MIN (1e-3); OPM_EW_LOG=1 writes one debug line per solve.
+        /// Neural gate (NeuralEwGate.hpp): OPM_EW_GATE_MODEL restricts the
+        /// loose tolerances to timestep attempts predicted to converge
+        /// (chop probability below OPM_EW_GATE_THRESHOLD, default 0.2);
+        /// OPM_EW_GATE_LOG writes the gate's features and outcomes per attempt.
+        /// Model-free gates, for baselines and training data: OPM_EW_GATE_RULE=N
+        /// allows loose solves only after an accepted step of at most N Newton
+        /// iterations that was not preceded by a chop; OPM_EW_RANDOM=p flips a
+        /// coin per attempt (seed OPM_EW_RANDOM_SEED, default 12345).
+        /// OPM_EW_COST_MODEL (train_ew_cost.py) predicts the attempt's cost in
+        /// both modes and takes the loose one when it is cheaper by more than
+        /// OPM_EW_COST_MARGIN (0.05).  OPM_EW_GATE_ONLINE=1 needs no model:
+        /// it measures the wall time per simulated second of loose and tight
+        /// attempts in the run itself (OPM_EW_ONLINE_WARMUP 40 alternating
+        /// attempts, then the cheaper mode by OPM_EW_ONLINE_MARGIN 0.1 with
+        /// OPM_EW_ONLINE_EPS 0.1 exploration over a window of
+        /// OPM_EW_ONLINE_WINDOW 300 attempts).  Precedence: cost model, chop
+        /// model, online, coin, rule.
+        void initEisenstatWalker()
+        {
+            const char* on = std::getenv("OPM_EW");
+            if (!on || std::string(on) == "0" || isNlddLocalSolver())
+                return;
+            const auto get = [](const char* name, const double fallback) {
+                const char* v = std::getenv(name);
+                return v ? std::stod(v) : fallback;
+            };
+            const auto& comm = simulator_.gridView().comm();
+            const bool rank0 = comm.rank() == 0;
+            ew_.enabled = true;
+            ew_.gamma = get("OPM_EW_GAMMA", 0.9);
+            ew_.alpha = get("OPM_EW_ALPHA", 2.0);
+            ew_.max_reduction = get("OPM_EW_MAX", 0.1);
+            ew_.min_reduction = get("OPM_EW_MIN", 1e-3);
+            ew_.log = std::getenv("OPM_EW_LOG") != nullptr;
+
+            const char* gate_model = std::getenv("OPM_EW_GATE_MODEL");
+            const char* cost_model = std::getenv("OPM_EW_COST_MODEL");
+            const char* gate_log = std::getenv("OPM_EW_GATE_LOG");
+            const int gate_rule = static_cast<int>(get("OPM_EW_GATE_RULE", 0.0));
+            const double gate_random = get("OPM_EW_RANDOM", -1.0);
+            const bool gate_online = get("OPM_EW_GATE_ONLINE", 0.0) > 0.0;
+            std::string gate_desc;
+            if (gate_model || cost_model || gate_log || gate_rule > 0 || gate_random >= 0.0 || gate_online) {
+                // Every rank keeps the history; rank 0 holds the models and the log.
+                ew_gate_ = std::make_unique<NeuralEwGate>(
+                    (rank0 && gate_model) ? gate_model : "",
+                    get("OPM_EW_GATE_THRESHOLD", 0.2),
+                    (rank0 && gate_log) ? gate_log : "");
+                ew_gate_->setRule(gate_rule);
+                ew_gate_->setRandom(gate_random,
+                                    static_cast<unsigned>(get("OPM_EW_RANDOM_SEED", 12345.0)));
+                if (gate_online)
+                    ew_gate_->setOnline(static_cast<int>(get("OPM_EW_ONLINE_WARMUP", 40.0)),
+                                        get("OPM_EW_ONLINE_MARGIN", 0.1),
+                                        get("OPM_EW_ONLINE_EPS", 0.1),
+                                        static_cast<int>(get("OPM_EW_ONLINE_WINDOW", 300.0)));
+                int loaded = (rank0 && ew_gate_->hasModel()) ? 1 : 0;
+                comm.broadcast(&loaded, 1, 0);
+                int cost_loaded = (rank0 && cost_model
+                                   && ew_gate_->loadCostModel(cost_model, get("OPM_EW_COST_MARGIN", 0.05)))
+                                  ? 1 : 0;
+                comm.broadcast(&cost_loaded, 1, 0);
+                if ((gate_model && !loaded) || (cost_model && !cost_loaded)) {
+                    // Asked for a gate that cannot work: stay with flow's tolerance.
+                    ew_.enabled = false;
+                    ew_gate_.reset();
+                    if (rank0)
+                        OpmLog::warning("Linear solver: no usable Eisenstat-Walker gate model in '"
+                                        + std::string((gate_model && !loaded) ? gate_model : cost_model)
+                                        + "' - keeping the fixed linear tolerance");
+                    return;
+                }
+                if (cost_loaded) {
+                    ew_.gate_mode = EwState::GateMode::Cost;
+                    gate_desc = ", gated by cost model " + std::string(cost_model)
+                                + " (loose when cheaper by " + std::to_string(ew_gate_->costMargin()) + ")";
+                } else if (loaded) {
+                    ew_.gate_mode = EwState::GateMode::Model;
+                    gate_desc = ", gated by " + std::string(gate_model) + " below chop probability "
+                                + std::to_string(ew_gate_->threshold());
+                } else if (gate_online) {
+                    ew_.gate_mode = EwState::GateMode::Online;
+                    gate_desc = ", online self-check (OPM_EW_GATE_ONLINE): warm-up "
+                                + std::to_string(static_cast<int>(get("OPM_EW_ONLINE_WARMUP", 40.0)))
+                                + " attempts, margin " + std::to_string(get("OPM_EW_ONLINE_MARGIN", 0.1))
+                                + ", exploration " + std::to_string(get("OPM_EW_ONLINE_EPS", 0.1));
+                } else if (gate_random >= 0.0) {
+                    ew_.gate_mode = EwState::GateMode::Random;
+                    gate_desc = ", loose with probability " + std::to_string(gate_random)
+                                + " per attempt (OPM_EW_RANDOM)";
+                } else if (gate_rule > 0) {
+                    ew_.gate_mode = EwState::GateMode::Rule;
+                    gate_desc = ", loose only after an accepted step of at most "
+                                + std::to_string(gate_rule) + " Newton iterations (OPM_EW_GATE_RULE)";
+                }
+                ew_.gated = ew_.gate_mode != EwState::GateMode::None;
+            }
+            if (rank0)
+                OpmLog::info("Linear solver: Eisenstat-Walker reductions (OPM_EW), gamma "
+                             + std::to_string(ew_.gamma) + ", alpha "
+                             + std::to_string(ew_.alpha) + ", range ["
+                             + std::to_string(ew_.min_reduction) + ", "
+                             + std::to_string(ew_.max_reduction) + "]" + gate_desc);
+        }
+
+        /// Residual reduction for the solve about to start from Eisenstat-Walker
+        /// forcing terms (choice 2), or a negative value when OPM_EW is off:
+        ///     eta_k = gamma * (|F_k| / |F_k-1|)^alpha,
+        /// safeguarded against sudden drops and clamped to [OPM_EW_MIN,
+        /// OPM_EW_MAX].  The first solve of each timestep attempt gets the
+        /// loosest value.  Call once per solve on all ranks: the residual norm
+        /// is a global reduction, and rank 0's value is broadcast so that every
+        /// rank's Krylov solver stops at the same iteration.
+        double ewReduction()
+        {
+            if (!ew_.enabled)
+                return -1.0;
+            const auto& comm = simulator_.gridView().comm();
+            const int j = simulator_.problem().iterationContext().iteration();
+            if (ew_gate_ && j == 0) {
+                // A new timestep attempt: the gate decides whether it may use
+                // loose tolerances.  Rank 0 decides, all ranks follow.
+                ew_gate_->beginAttempt(simulator_.time(), simulator_.timeStepSize());
+                int loose = 1;
+                if (ew_.gated && comm.rank() == 0) {
+                    double p = -1.0;
+                    switch (ew_.gate_mode) {
+                    case EwState::GateMode::Cost:
+                        // p logs the predicted loose/tight cost ratio here.
+                        loose = ew_gate_->costAllows(p) ? 1 : 0;
+                        break;
+                    case EwState::GateMode::Model:
+                        p = ew_gate_->probability();
+                        loose = p < ew_gate_->threshold() ? 1 : 0;
+                        break;
+                    case EwState::GateMode::Online:
+                        // p logs the measured loose/tight price ratio (-1 while exploring).
+                        loose = ew_gate_->onlineAllows(p) ? 1 : 0;
+                        break;
+                    case EwState::GateMode::Random:
+                        loose = ew_gate_->coin() ? 1 : 0;
+                        break;
+                    case EwState::GateMode::Rule:
+                        loose = ew_gate_->ruleAllows() ? 1 : 0;
+                        break;
+                    case EwState::GateMode::None:
+                        break;
+                    }
+                    ew_gate_->setDecision(p, loose != 0);
+                }
+                if (ew_.gated && isParallel())
+                    comm.broadcast(&loose, 1, 0);
+                ew_.attempt_loose = loose != 0;
+            }
+            if (!ew_.attempt_loose)
+                return -1.0;  // a risky attempt keeps flow's fixed tolerance
+            const double norm = std::sqrt(comm.sum(rhs_->two_norm2()));
+            double eta = ew_.max_reduction;
+            double ratio = 0.0;
+            if (j > 0 && ew_.prev_norm > 0.0) {
+                ratio = norm / ew_.prev_norm;
+                eta = ew_.gamma * std::pow(ratio, ew_.alpha);
+                const double guard = ew_.gamma * std::pow(ew_.prev_eta, ew_.alpha);
+                if (guard > 0.1)
+                    eta = std::max(eta, guard);
+                eta = std::clamp(eta, ew_.min_reduction, ew_.max_reduction);
+            }
+            if (isParallel())
+                comm.broadcast(&eta, 1, 0);
+            ew_.prev_norm = norm;
+            ew_.prev_eta = eta;
+            if (ew_.log && comm.rank() == 0)
+                OpmLog::debug("EisenstatWalker: newton " + std::to_string(j)
+                              + " residual ratio " + std::to_string(ratio)
+                              + " reduction " + std::to_string(eta));
+            return eta;
         }
 
         /// Format the current prm_ config as "type:weight:fine:coarse".
@@ -891,10 +1101,22 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                     simulator_.gridView().comm().broadcast(&label, 1, 0);
                 cfg = NeuralCprPolicy::actionFromLabel(label);
             } else {
-                cfg = neural_policy_->predict(feat, &score);
+                // No prediction (the model could not be evaluated): keep the
+                // current configuration.  In rule mode the schedule always
+                // has an answer (confidence 1).
+                std::optional<CprPolicyAction> predicted;
+                if (rule_mode_) {
+                    predicted = NeuralCprPolicy::ruleBasedPredict(feat);
+                    score = 1.0f;
+                } else {
+                    predicted = neural_policy_->predict(feat, &score);
+                }
+                const bool have = predicted.has_value();
+                if (have)
+                    cfg = *predicted;
 
                 // On a failed previous solve revert to the default solver.
-                if (last_solve_failed_)
+                if (have && last_solve_failed_)
                     cfg = NeuralCprPolicy::actionFromLabel(anchor_label_);
 
                 // In a parallel run each MPI rank predicts from its own local
@@ -906,7 +1128,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 // solver objects and deadlock in AMG / overlap setup.
                 if (isParallel()) {
                     int label = -1;
-                    if (rank0 && (!policy_cfg_valid_ || score >= confidence_threshold_))
+                    if (rank0 && have && (!policy_cfg_valid_ || score >= confidence_threshold_))
                         label = policyLabel(cfg);
                     simulator_.gridView().comm().broadcast(&label, 1, 0);
                     if (label < 0)
@@ -914,7 +1136,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                     cfg = NeuralCprPolicy::actionFromLabel(label);
                 } else {
                     // Serial path: keep existing threshold check.
-                    if (policy_cfg_valid_ && score < confidence_threshold_)
+                    if (!have || (policy_cfg_valid_ && score < confidence_threshold_))
                         return;
                 }
             }
@@ -1132,15 +1354,22 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
             // Solve system.
             Dune::InverseOperatorResult result;
+            const double ew_reduction = ewReduction();
             {
                 OPM_TIMEBLOCK(flexibleSolverApply);
                 assert(flexibleSolver_[activeSolverNum_].solver_);
                 auto t0 = std::chrono::steady_clock::now();
-                flexibleSolver_[activeSolverNum_].solver_->apply(x, *rhs_, result);
-                if (sweep_log_) {
-                    double solve_ms = std::chrono::duration<double, std::milli>(
+                if (ew_reduction > 0.0)
+                    flexibleSolver_[activeSolverNum_].solver_->apply(x, *rhs_, ew_reduction, result);
+                else
+                    flexibleSolver_[activeSolverNum_].solver_->apply(x, *rhs_, result);
+                if (ew_gate_ || sweep_log_) {
+                    const double solve_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
-                    writeSweepRow(solve_ms);
+                    if (ew_gate_)
+                        ew_gate_->addSolve(result.iterations, last_setup_ms_ + solve_ms);
+                    if (sweep_log_)
+                        writeSweepRow(solve_ms);
                 }
             }
 
@@ -1421,6 +1650,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         std::unique_ptr<NeuralCprPolicy> neural_policy_;
         float           confidence_threshold_ = 0.6f;  ///< min softmax prob to allow a config switch
         bool            anchored_mode_        = false; ///< cost-model decisions (OPM_NEURAL_CPR_MIN_GAIN)
+        bool            rule_mode_            = false; ///< deterministic schedule (OPM_NEURAL_CPR_RULE=1)
         float           min_gain_             = 0.05f; ///< log-cost gain needed to leave the anchor
         int             anchor_label_         = 12;    ///< flow-default solver (8 on decks without wells)
         bool            amg_mode_             = false; ///< choose AMG parameters (OPM_NEURAL_CPR_ACTIONS=amg)
@@ -1449,6 +1679,23 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         int               last_episode_idx_ = 0; ///< simulator episode index at last prepare()
         double            last_setup_ms_    = 0.0; ///< prepareFlexibleSolver() wall time (ms)
         bool              last_setup_rebuilt_ = false; ///< last prepareFlexibleSolver() rebuilt the solver
+
+        // Eisenstat-Walker forcing terms (OPM_EW), see initEisenstatWalker()
+        struct EwState {
+            bool   enabled = false;
+            double gamma = 0.9;
+            double alpha = 2.0;
+            double max_reduction = 0.1;
+            double min_reduction = 1e-3;
+            bool   log = false;         ///< OPM_EW_LOG: one debug line per solve
+            double prev_norm = -1.0;    ///< global residual norm at the previous solve
+            double prev_eta = 0.0;      ///< reduction used for the previous solve
+            bool   gated = false;       ///< a gate decides per attempt
+            enum class GateMode { None, Cost, Model, Online, Random, Rule };
+            GateMode gate_mode = GateMode::None;
+            bool   attempt_loose = true; ///< the current attempt may use loose tolerances
+        } ew_;
+        std::unique_ptr<NeuralEwGate> ew_gate_;  ///< OPM_EW_GATE_MODEL / OPM_EW_GATE_LOG
 
         // Neural early-abort policy (OPM_CPR_ABORT_MODEL)
         std::unique_ptr<NeuralAbortPolicy> abort_policy_;

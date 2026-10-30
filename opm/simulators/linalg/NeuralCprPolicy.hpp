@@ -26,6 +26,7 @@
 #include <opm/ml/ml_model.hpp>
 
 #include <array>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,12 +35,10 @@ namespace Opm {
 
 /// Neural CPR policy backed by the OPM Kerasify ML framework.
 ///
-/// Two operating modes:
-///   MLP inference  — when a valid Kerasify model file is loaded
-///                    (isLoaded() == true).  Runs a 14→32→16→24 MLP via
-///                    Opm::ML::NNModel<float>.
-///   Rule-based     — deterministic heuristic based on Newton iteration
-///                    index and residual reduction ratio; no file I/O.
+/// MLP inference when a valid Kerasify model file is loaded (isLoaded() ==
+/// true), via Opm::ML::NNModel<float>.  Without a usable model, or when the
+/// model cannot be evaluated, it makes no decision and flow keeps its own
+/// solver configuration.
 ///
 /// The model file is produced by the companion Python export script using
 /// opm-common's opm.ml.ml_tools.kerasify.export_model().
@@ -51,7 +50,7 @@ namespace Opm {
 class NeuralCprPolicy {
 public:
     /// Construct.  If model_path is empty or the file cannot be loaded,
-    /// falls back to rule-based prediction (isLoaded() == false).
+    /// isLoaded() is false and the policy makes no decisions.
     explicit NeuralCprPolicy(const std::string& model_path = "");
 
     ~NeuralCprPolicy() = default;
@@ -70,12 +69,20 @@ public:
             forbidden_mask_ |= (1u << label);
     }
 
-    /// Predict the best CPR configuration for the given features.
+    /// Predict the best CPR configuration for the given features, or nothing
+    /// when the model cannot be evaluated (then flow keeps its configuration).
     /// If \p out_confidence is non-null it receives the softmax probability of
-    /// the top label (0–1).  Rule-based mode always writes 1.0.
+    /// the top label (0–1), or 0 when there is no prediction.
     /// Forbidden labels (see forbidLabel()) are never returned.
-    CprPolicyAction predict(const CprPolicyFeatures& feat,
-                            float* out_confidence = nullptr) const;
+    std::optional<CprPolicyAction> predict(const CprPolicyFeatures& feat,
+                                           float* out_confidence = nullptr) const;
+
+    /// Deterministic CPR schedule from the Newton iteration index and the
+    /// residual reduction (no model): cheap quasi-IMPES/ILU0 on the first
+    /// Newton step, quasi-IMPES/DILU mid-convergence, true-IMPES/DILU when
+    /// Newton struggles.  This was the branch's silent default until the
+    /// 2026-10-29 inertness fix; it is now explicit (OPM_NEURAL_CPR_RULE=1).
+    static CprPolicyAction ruleBasedPredict(const CprPolicyFeatures& feat);
 
     /// Cost-model mode (models from train_cpr_cost.py exported with tau=1,
     /// whose outputs are -log(cost) per label).  Returns the cheapest allowed
@@ -135,7 +142,6 @@ private:
     /// Run the MLP; forbidden labels are set to -inf.  False on failure.
     bool scores(const CprPolicyFeatures& feat, std::vector<float>& out) const;
 
-    static CprPolicyAction ruleBasedPredict(const CprPolicyFeatures& feat);
     static CprPolicyAction decodeLogits(const std::vector<float>& logits);
 };
 
