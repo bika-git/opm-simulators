@@ -124,7 +124,10 @@ def normalise(row: dict) -> np.ndarray:
         float(np.clip(
             math.log10(max(float(row.get("condition_number_estimate", "1.0")), 1.0)) / 10.0,
             0.0, 1.0)),
-        c01(float(row.get("bhp_well_fraction", "0.0")))
+        c01(float(row.get("bhp_well_fraction", "0.0"))),
+        # 19: diag_dominance on a log scale (1 → 0, 1e10 → 1); the linear
+        # transform in slot 6 saturates above 4 on nearly every black-oil solve.
+        c01(math.log10(max(float(row["diag_dominance"]), 1.0)) / 10.0),
     ], dtype=np.float32)
 
 

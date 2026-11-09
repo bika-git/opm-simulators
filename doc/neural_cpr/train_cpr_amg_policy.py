@@ -35,6 +35,27 @@ from continual import (save_anchor, load_anchor, merge_fisher,  # noqa: E402
 DAMPING = [1.0, 1.3, 1.6]
 TARGET = [1200, 600, 300]
 N_FEAT = 12
+# Reduced input layouts of the AMG model, as indices into normalise(), keyed
+# by input count.  Flow recognises the layout by the model's input size
+# (NeuralCprPolicy::amgFeatureIndex); any other size reads the leading
+# features.  prev_solve_failed (8) is never used: the policy does not run
+# after a failed solve, so it is always 0.
+#   5: dt_ratio, nl_residual_norm, nl_residual_reduce, diag_dominance,
+#      num_cells_log  (best 5-set in a held-out-deck search, 10 seeds)
+#   7: dt_days, dt_ratio, nl_residual_norm, nl_residual_reduce, nl_iteration,
+#      prev_linsolver_iters, num_cells_log  (hand-picked)
+#   8, 9, 10: best sets of that size in the same search
+AMG_LAYOUTS = {5: [1, 2, 3, 6, 10], 7: [0, 1, 2, 3, 4, 7, 10],
+               8: [0, 1, 2, 5, 6, 7, 10, 11], 9: [0, 2, 3, 5, 6, 7, 9, 10, 11],
+               10: [0, 1, 2, 3, 4, 5, 6, 7, 10, 11], 12: list(range(12))}
+AMG_FEATURES = AMG_LAYOUTS[7]
+
+
+def parse_features(s):
+    """'7' -> AMG_LAYOUTS[7]; '0,1,2,3,4,6,7' -> that list."""
+    if "," in s:
+        return [int(i) for i in s.split(",")]
+    return AMG_LAYOUTS[int(s)]
 TAG = re.compile(r"_pd([0-9.]+)_ct(\d+)\.csv$")
 
 
@@ -45,9 +66,9 @@ def slots(d, t, additive):
     return [d * len(TARGET) + t]
 
 
-def load_windows(paths):
-    """X (n x 12), damping index, target index, log cost per solve, deck,
-    report-step group, and whether the window comes from the default run."""
+def load_windows(paths, features=AMG_FEATURES):
+    """X (n x len(features)), damping index, target index, log cost per solve,
+    deck and report-step group."""
     by_src = defaultdict(list)
     for _, src, row in iter_rows(paths):
         by_src[src].append(row)
@@ -61,7 +82,7 @@ def load_windows(paths):
         for i, r in enumerate(rows + [None]):
             if r is None or r["setup_rebuilt"] == "1":
                 if start is not None:
-                    X.append(normalise(rows[start])[:N_FEAT])
+                    X.append(normalise(rows[start])[features])
                     di.append(d)
                     ti.append(t)
                     y.append(math.log(max(ms[start:i].mean(), 1e-3)))
@@ -76,7 +97,7 @@ def train(X, di, ti, y, w, Xv, dv, tv, yv, wv, hidden, depth, epochs, lr, batch,
           seed, patience, additive,
           ewc_anchor=None, ewc_fisher=None, ewc_lambda=0.0):
     n_out = len(DAMPING) + len(TARGET) if additive else len(DAMPING) * len(TARGET)
-    mlp = MLP(hidden=hidden, activation="relu", seed=seed, n_features=N_FEAT, depth=depth)
+    mlp = MLP(hidden=hidden, activation="relu", seed=seed, n_features=X.shape[1], depth=depth)
     mlp.weights[-1] = mlp.weights[-1][:n_out].copy()
     mlp.biases[-1] = np.zeros(n_out, np.float32)
     Ws, bs = mlp.weights, mlp.biases
@@ -158,6 +179,15 @@ def main():
     ap.add_argument("--margins", type=float, nargs="+", default=[0.0, 0.02, 0.05, 0.1])
     ap.add_argument("--additive", action="store_true",
                     help="One output per parameter level instead of per combination")
+    ap.add_argument("--features", type=parse_features, default=AMG_LAYOUTS[7],
+                    help="input layout: a feature count (AMG_LAYOUTS; 12 = the first 12 "
+                         "features as in older models) or an explicit comma-separated list "
+                         "of feature indices, which flow must be given as "
+                         "OPM_NEURAL_CPR_AMG_FEATURES")
+    ap.add_argument("--relative", action="store_true",
+                    help="train on log cost relative to the default pair's mean log cost in "
+                         "the same deck and report step, so the model need not learn each "
+                         "deck's cost level (the decision only uses differences between pairs)")
     ap.add_argument("--seed", type=int, default=42)
 
     # ── Continual learning ──
@@ -178,9 +208,19 @@ def main():
                     help="EMA decay for merging Fisher diagonals (default 0.9)")
     args = ap.parse_args()
 
-    X, di, ti, y, deck, grp = load_windows(args.csvs)
+    X, di, ti, y, deck, grp = load_windows(args.csvs, args.features)
     print(f"{len(y)} reuse windows from {len(args.csvs)} runs: "
           f"{dict(Counter(deck.tolist()))}")
+    if args.relative:
+        default = (di == 0) & (ti == 0)
+        level = {}
+        for g in set(grp):
+            sel = np.array([h == g for h in grp]) & default
+            if not sel.any():                      # no default window here: deck level
+                sel = (deck == g[0]) & default
+            level[g] = float(y[sel].mean())
+        y = y - np.array([level[g] for g in grp], np.float32)
+        print(f"  relative targets: log cost minus the default pair's mean per (deck, report step)")
 
     # ── Replay: mix old windows into training data ──
     if args.replay_buffer:

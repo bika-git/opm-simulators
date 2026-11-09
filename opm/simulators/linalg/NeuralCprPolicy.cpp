@@ -23,8 +23,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -106,6 +108,21 @@ NeuralCprPolicy::NeuralCprPolicy(const std::string& model_path)
                             + " features but binary only provides " + std::to_string(nf)
                             + " — using rule-based fallback");
             valid_ = false;
+        }
+        // Explicit AMG input layout (train_cpr_amg_policy.py --features i,j,...).
+        if (const char* env = std::getenv("OPM_NEURAL_CPR_AMG_FEATURES")) {
+            std::stringstream ss(env);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                amg_features_.push_back(std::stoi(tok));
+            if (static_cast<int>(amg_features_.size()) != model_input_size_) {
+                OpmLog::warning("NeuralCprPolicy: OPM_NEURAL_CPR_AMG_FEATURES lists "
+                                + std::to_string(amg_features_.size()) + " features but the model has "
+                                + std::to_string(model_input_size_) + " inputs — ignored");
+                amg_features_.clear();
+            } else {
+                OpmLog::info("NeuralCprPolicy: AMG input layout " + std::string(env));
+            }
         }
     }
 }
@@ -193,7 +210,7 @@ std::pair<int, int> NeuralCprPolicy::chooseAmgAnchored(const CprPolicyFeatures& 
     auto arr = feat.toArray();
     Opm::ML::Tensor<float> in(model_input_size_);
     for (int i = 0; i < model_input_size_; ++i)
-        in(i) = arr[i];
+        in(i) = arr[amg_features_.empty() ? amgFeatureIndex(model_input_size_, i) : amg_features_[i]];
     Opm::ML::Tensor<float> res;
     const auto nd = static_cast<int>(kAmgDamping.size());
     const auto nt = static_cast<int>(kAmgCoarsenTarget.size());

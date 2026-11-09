@@ -97,6 +97,29 @@ public:
                                           float* out_gain = nullptr) const;
     static constexpr std::array<double, 3> kAmgDamping{1.0, 1.3, 1.6};
     static constexpr std::array<int, 3> kAmgCoarsenTarget{1200, 600, 300};
+    /// Reduced input layouts of the AMG model (AMG_LAYOUTS in
+    /// train_cpr_amg_policy.py), recognised by the model's input count.  Returns
+    /// the index into CprPolicyFeatures::toArray() of input \p i; models of any
+    /// other input size read the leading features.
+    static int amgFeatureIndex(int n_inputs, int i)
+    {
+        // 5: dt_ratio, nl_residual_norm, nl_residual_reduce, diag_dominance, num_cells_log
+        static constexpr std::array<int, 5> k5{1, 2, 3, 6, 10};
+        // 7: dt_days, dt_ratio, nl_residual_norm, nl_residual_reduce, nl_iteration,
+        //    prev_linsolver_iters, num_cells_log
+        static constexpr std::array<int, 7> k7{0, 1, 2, 3, 4, 7, 10};
+        static constexpr std::array<int, 8> k8{0, 1, 2, 5, 6, 7, 10, 11};
+        static constexpr std::array<int, 9> k9{0, 2, 3, 5, 6, 7, 9, 10, 11};
+        static constexpr std::array<int, 10> k10{0, 1, 2, 3, 4, 5, 6, 7, 10, 11};
+        switch (n_inputs) {
+        case 5:  return k5[i];
+        case 7:  return k7[i];
+        case 8:  return k8[i];
+        case 9:  return k9[i];
+        case 10: return k10[i];
+        default: return i;
+        }
+    }
 
     bool isForbidden(int label) const
     {
@@ -127,6 +150,9 @@ private:
     bool     valid_            = false;
     int      model_input_size_ = CprPolicyFeatures::kNumFeatures;
     uint32_t forbidden_mask_   = 0;  ///< bitmask of labels never to select
+    /// Explicit AMG input layout from OPM_NEURAL_CPR_AMG_FEATURES (comma-separated
+    /// indices into toArray()); empty = layout by input count (amgFeatureIndex).
+    std::vector<int> amg_features_;
 
     /// Read the input feature count from the first Dense layer of a binary model file.
     /// Returns CprPolicyFeatures::kNumFeatures on any parse failure.

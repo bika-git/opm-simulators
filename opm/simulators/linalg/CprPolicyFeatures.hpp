@@ -55,7 +55,7 @@ struct CprPolicyFeatures {
     double condition_number_estimate= 1.0;  ///< max_diag / min_diag over sampled rows
     double bhp_well_fraction        = 0.0;  ///< fraction of wells currently on BHP control
 
-    static constexpr int kNumFeatures = 19;
+    static constexpr int kNumFeatures = 20;
 
     /// Return all features normalised to approximately [0, 1].
     std::array<float, kNumFeatures> toArray() const
@@ -88,7 +88,11 @@ struct CprPolicyFeatures {
             static_cast<float>(                              // log: 1→0, 1e5→0.5, 1e10→1
                 std::clamp(std::log10(std::max(condition_number_estimate, 1.0)) / 10.0,
                            0.0, 1.0)),
-            c01(bhp_well_fraction)                           // already [0,1]
+            c01(bhp_well_fraction),                          // already [0,1]
+            // 19: diag_dominance on a log scale (1 → 0, 1e10 → 1); the linear
+            // transform in slot 6 saturates above 4 on nearly every black-oil solve.
+            static_cast<float>(
+                std::clamp(std::log10(std::max(diag_dominance, 1.0)) / 10.0, 0.0, 1.0))
         }};
     }
 };
