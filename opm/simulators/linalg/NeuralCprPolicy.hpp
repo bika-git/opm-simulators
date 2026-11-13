@@ -105,6 +105,10 @@ public:
     {
         // 5: dt_ratio, nl_residual_norm, nl_residual_reduce, diag_dominance, num_cells_log
         static constexpr std::array<int, 5> k5{1, 2, 3, 6, 10};
+        // 6: dt_days, dt_ratio, nl_residual_norm (wide log scale, slot 20),
+        //    nl_residual_reduce, nl_iteration, prev_linsolver_iters: state
+        //    only, no diag_dominance and no problem descriptor
+        static constexpr std::array<int, 6> k6{0, 1, 20, 3, 4, 7};
         // 7: dt_days, dt_ratio, nl_residual_norm, nl_residual_reduce, nl_iteration,
         //    prev_linsolver_iters, num_cells_log
         static constexpr std::array<int, 7> k7{0, 1, 2, 3, 4, 7, 10};
@@ -113,6 +117,7 @@ public:
         static constexpr std::array<int, 10> k10{0, 1, 2, 3, 4, 5, 6, 7, 10, 11};
         switch (n_inputs) {
         case 5:  return k5[i];
+        case 6:  return k6[i];
         case 7:  return k7[i];
         case 8:  return k8[i];
         case 9:  return k9[i];

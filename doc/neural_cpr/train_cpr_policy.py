@@ -128,6 +128,10 @@ def normalise(row: dict) -> np.ndarray:
         # 19: diag_dominance on a log scale (1 → 0, 1e10 → 1); the linear
         # transform in slot 6 saturates above 4 on nearly every black-oil solve.
         c01(math.log10(max(float(row["diag_dominance"]), 1.0)) / 10.0),
+        # 20: nl_residual_norm on a wider log scale (1e-14 → 0, 1e4 → 1).  Slot 2
+        # is not clipped and runs to 1.0..1.22 on black-oil decks (norms 1..1e3
+        # in field units); below 1e4 slot 20 is slot 2 scaled by 14/18.
+        c01((math.log10(max(float(row["nl_residual_norm"]), 1e-14)) + 14.0) / 18.0),
     ], dtype=np.float32)
 
 

@@ -40,6 +40,13 @@ H = best of {8,12,16,24,32} from architecture search; depth 1 or 2).
 MLP: `12 → H → 9` (3 dampings × 3 coarsening targets). Outputs are negated
 log costs; argmax picks the cheapest predicted combination.
 
+Models with fewer inputs read a reduced layout, recognised by the input count
+(`AMG_LAYOUTS` in `train_cpr_amg_policy.py`, `NeuralCprPolicy::amgFeatureIndex`).
+The six-input layout `0,1,20,3,4,7` reads solver state only: time step, time
+step ratio, residual norm, residual reduction, Newton iteration and the
+previous solve's Krylov iterations. Trained models and how each was made are
+listed in `models/README.md`.
+
 ### Neural abort
 
 MLP: `14 → H → 1` (sigmoid). Predicts P(chop) at each Newton iteration.
@@ -147,6 +154,12 @@ python train_cpr_policy.py \
 python train_cpr_amg_policy.py \
     --csvs amg_sweep/**/*.csv --out cpr_amg_policy.model
 
+# AMG policy, six state inputs, target that also counts the Newton iterations
+# a setting costs or saves, three seeds packed (see models/README.md)
+python train_cpr_amg_policy.py \
+    --csvs amg_sweep/*_pd*_ct*.csv --features 6 --relative --newton-cost \
+    --seeds 42 100 200 --out cpr_amg_policy_6feat.model
+
 # Abort policy (from sweep .DBG logs)
 python train_abort_policy.py \
     --train sweep_run1/**/*.DBG --out abort.model
@@ -165,6 +178,7 @@ see [CONTINUAL_LEARNING_README.md](CONTINUAL_LEARNING_README.md).
 | `OPM_NEURAL_CPR_WEIGHTS` | unset | Path to CPR variant or AMG model |
 | `OPM_NEURAL_CPR_ACTIONS` | `variant` | `variant` or `amg` |
 | `OPM_NEURAL_CPR_MIN_GAIN` | `0.05` | AMG policy: min log-cost gain to switch |
+| `OPM_NEURAL_CPR_AMG_FEATURES` | unset | AMG policy: input layout as comma-separated feature slots, one per model input (the trainer's `--features i,j,...`); unset = layout by input count |
 | `OPM_NEURAL_CPR_CONFIDENCE` | `0.6` | CPR variant: softmax confidence to switch |
 | `OPM_NEURAL_CPR_FORBID_LABELS` | unset | Comma-separated labels to exclude (e.g. `16,17,18,19,20,21,22,23` for SPE11) |
 | `OPM_NEURAL_CPR_DISABLE` | unset | `1` to disable CPR variant (abort-only mode) |

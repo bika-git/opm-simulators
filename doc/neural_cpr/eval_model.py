@@ -111,20 +111,13 @@ def eval_policy(layers, args):
 
 
 def eval_amg(layers, args):
-    from train_cpr_amg_policy import AMG_LAYOUTS, DAMPING, TARGET, load_windows, slots
+    from train_cpr_amg_policy import AMG_LAYOUTS, DAMPING, TARGET, load_windows, slots, targets
     n_in = layers[0][0].shape[0]
     feats = args.features or AMG_LAYOUTS.get(n_in, list(range(n_in)))
     assert len(feats) == n_in, f"model has {n_in} inputs, {len(feats)} features given"
-    X, di, ti, y, deck, grp = load_windows(args.csvs, feats)
-    if args.relative:                            # same target shift as the trainer's --relative
-        default = (di == 0) & (ti == 0)
-        level = {}
-        for g in set(grp):
-            sel = np.array([h == g for h in grp]) & default
-            if not sel.any():
-                sel = (deck == g[0]) & default
-            level[g] = float(y[sel].mean())
-        y = y - np.array([level[g] for g in grp], np.float32)
+    X, di, ti, y, deck, grp, sweep, newton = load_windows(args.csvs, feats, args.newton_block)
+    # the trainer's target (--relative, --newton-cost)
+    y = targets(y, di, ti, deck, grp, sweep, newton, args.relative, args.newton_cost)
     out = -predict(layers, X)                    # exported as -log cost
     additive = out.shape[1] == len(DAMPING) + len(TARGET)
     names, inv, counts = np.unique(deck, return_inverse=True, return_counts=True)
@@ -207,6 +200,9 @@ def main():
                    help="explicit feature indices (default: layout by input count)")
     p.add_argument("--relative", action="store_true",
                    help="model was trained with --relative: score against the shifted target")
+    p.add_argument("--newton-cost", action="store_true",
+                   help="model was trained with --newton-cost: score against that target")
+    p.add_argument("--newton-block", type=int, default=150)
     p = sub.add_parser("abort")
     p.add_argument("--runs", nargs="+", required=True,
                    help="DBG files, each with its sweep CSV next to it")

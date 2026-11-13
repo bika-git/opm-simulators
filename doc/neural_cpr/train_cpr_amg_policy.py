@@ -11,7 +11,21 @@ which grows with the sum of levels rather than their product.
 
 Samples are CPR reuse windows (a setup rebuild plus the solves reusing it)
 with denoised cost (train_cpr_cost.modelled_ms), from a sweep whose CSVs are
-named <deck>_pd<damping>_ct<target>.csv (tmp/sweep_amg_*/driver.py).
+named <deck>_pd<damping>_ct<target>.csv (tmp/sweep_amg_*/driver.py).  The CSVs
+of several sweeps (one directory each) can be given together; each sweep is
+then compared with its own default run.
+
+The cost of a window is the cost of one linear solve.  A pair also changes how
+many solves a run needs: on Norne damping 1.3 takes 12 % more Newton
+iterations than the default, on SPE11A 12 % fewer, identically in every sweep,
+while the per-solve costs of the pairs differ by a few per cent.  --newton-cost
+adds that factor to the target (log of the solves of the pair's run over the
+solves of the default run, in the report steps around the window), so that the
+model ranks the pairs by what a stretch of simulation costs.  Without it Norne
+is a near-tie between damping 1.0 and 1.3 on the label (-19.6 % against
+-18.0 % with target 300) although whole runs differ by 9 points (-17.3 %
+against -8.4 %), and which side a trained model takes changes from one sweep
+to the next.
 
 Export: outputs are negated (-log cost), so higher is cheaper; flow
 (OPM_NEURAL_CPR_ACTIONS=amg) recognises the layout by the number of outputs.
@@ -42,10 +56,13 @@ N_FEAT = 12
 # after a failed solve, so it is always 0.
 #   5: dt_ratio, nl_residual_norm, nl_residual_reduce, diag_dominance,
 #      num_cells_log  (best 5-set in a held-out-deck search, 10 seeds)
+#   6: dt_days, dt_ratio, nl_residual_norm on the wide log scale (slot 20),
+#      nl_residual_reduce, nl_iteration, prev_linsolver_iters: state only, no
+#      diag_dominance and no problem descriptor
 #   7: dt_days, dt_ratio, nl_residual_norm, nl_residual_reduce, nl_iteration,
 #      prev_linsolver_iters, num_cells_log  (hand-picked)
 #   8, 9, 10: best sets of that size in the same search
-AMG_LAYOUTS = {5: [1, 2, 3, 6, 10], 7: [0, 1, 2, 3, 4, 7, 10],
+AMG_LAYOUTS = {5: [1, 2, 3, 6, 10], 6: [0, 1, 20, 3, 4, 7], 7: [0, 1, 2, 3, 4, 7, 10],
                8: [0, 1, 2, 5, 6, 7, 10, 11], 9: [0, 2, 3, 5, 6, 7, 9, 10, 11],
                10: [0, 1, 2, 3, 4, 5, 6, 7, 10, 11], 12: list(range(12))}
 AMG_FEATURES = AMG_LAYOUTS[7]
@@ -66,17 +83,27 @@ def slots(d, t, additive):
     return [d * len(TARGET) + t]
 
 
-def load_windows(paths, features=AMG_FEATURES):
-    """X (n x len(features)), damping index, target index, log cost per solve,
-    deck and report-step group."""
+def load_windows(paths, features=AMG_FEATURES, newton_block=150):
+    """Reuse windows of the sweep runs in `paths`.  Returns
+      X (n x len(features)), damping index, target index, log cost per solve,
+      deck, group (deck, report step), sweep (the directory of the window's
+      CSV) and newton: log of the number of solves the window's run needed
+      over the number the default run of the same sweep and deck needed, both
+      counted over the smallest block of report steps centred on the window's
+      in which the default run has at least newton_block solves (the whole
+      run if it has fewer; 0 where the sweep has no default run of the deck).
+    Runs of different sweeps stay apart even if their files share names."""
     by_src = defaultdict(list)
-    for _, src, row in iter_rows(paths):
-        by_src[src].append(row)
-    X, di, ti, y, deck_of, grp = [], [], [], [], [], []
-    for src, rows in by_src.items():
+    for path in paths:
+        for _, src, row in iter_rows([path]):
+            by_src[(str(Path(path).parent), src)].append(row)
+    X, di, ti, y, deck_of, grp, sweep_of = [], [], [], [], [], [], []
+    solves = {}                                   # (sweep, deck, d, t) -> solves per report step
+    for (sweep, src), rows in by_src.items():
         m = TAG.search(src)
         deck = src[:m.start()]
         d, t = DAMPING.index(float(m[1])), TARGET.index(int(m[2]))
+        solves[(sweep, deck, d, t)] = Counter(int(r["episode"]) for r in rows)
         ms = modelled_ms(rows)
         start = None
         for i, r in enumerate(rows + [None]):
@@ -87,10 +114,68 @@ def load_windows(paths, features=AMG_FEATURES):
                     ti.append(t)
                     y.append(math.log(max(ms[start:i].mean(), 1e-3)))
                     deck_of.append(deck)
-                    grp.append((deck, rows[start]["episode"]))
+                    grp.append((deck, int(rows[start]["episode"])))
+                    sweep_of.append(sweep)
                 start = i
+
+    blocks = {}
+
+    def block(sweep, deck, episode):
+        """Report steps of the block around `episode` (see above)."""
+        key = (sweep, deck, episode)
+        if key not in blocks:
+            n0 = solves[(sweep, deck, 0, 0)]
+            eps = sorted(n0)
+            i = (eps.index(episode) if episode in n0
+                 else min(range(len(eps)), key=lambda k: abs(eps[k] - episode)))
+            lo = hi = i
+            while (sum(n0[eps[k]] for k in range(lo, hi + 1)) < newton_block
+                   and (lo > 0 or hi < len(eps) - 1)):
+                lo, hi = max(lo - 1, 0), min(hi + 1, len(eps) - 1)
+            blocks[key] = eps[lo:hi + 1]
+        return blocks[key]
+
+    newton = []
+    for sweep, (deck, episode), d, t in zip(sweep_of, grp, di, ti):
+        if (sweep, deck, 0, 0) not in solves:
+            newton.append(0.0)
+            continue
+        steps = block(sweep, deck, episode)
+        n = solves[(sweep, deck, d, t)]
+        newton.append(math.log(max(sum(n.get(k, 0) for k in steps), 1)
+                               / sum(solves[(sweep, deck, 0, 0)][k] for k in steps)))
     return (np.asarray(X, np.float32), np.asarray(di), np.asarray(ti),
-            np.asarray(y, np.float32), np.asarray(deck_of), grp)
+            np.asarray(y, np.float32), np.asarray(deck_of), grp,
+            np.asarray(sweep_of), np.asarray(newton, np.float32))
+
+
+def targets(y, di, ti, deck, grp, sweep, newton, relative, newton_cost):
+    """The training target of each window, from its log cost per solve.
+
+    relative: minus the default pair's mean log cost in the same sweep, deck
+    and report step (the deck's mean where the default run has no window in
+    that step), so the model need not learn each deck's cost level.
+    newton_cost: plus `newton` (load_windows), so a pair is also charged for
+    the Newton iterations it costs or saves."""
+    if relative:
+        where = defaultdict(list)                 # default-pair windows per step and per deck
+        for i in np.flatnonzero((di == 0) & (ti == 0)):
+            where[(sweep[i], grp[i])].append(i)
+            where[(sweep[i], grp[i][0])].append(i)
+        level = np.empty(len(y), np.float32)
+        mean = {}
+        for i, (s, g) in enumerate(zip(sweep, grp)):
+            key = (s, g) if (s, g) in where else (s, g[0])
+            if key not in where:
+                sys.exit(f"--relative: no default-pair (pd{DAMPING[0]}/ct{TARGET[0]}) run of "
+                         f"{g[0]} in {s}")
+            if key not in mean:
+                mean[key] = float(y[where[key]].mean())
+            level[i] = mean[key]
+        y = y - level
+    if newton_cost:
+        y = y + newton
+    return y
 
 
 def train(X, di, ti, y, w, Xv, dv, tv, yv, wv, hidden, depth, epochs, lr, batch,
@@ -188,7 +273,17 @@ def main():
                     help="train on log cost relative to the default pair's mean log cost in "
                          "the same deck and report step, so the model need not learn each "
                          "deck's cost level (the decision only uses differences between pairs)")
+    ap.add_argument("--newton-cost", action="store_true",
+                    help="also charge a pair for the Newton iterations it costs or saves: "
+                         "add the log of (solves of the pair's run / solves of the default "
+                         "run) over the surrounding report steps to the target")
+    ap.add_argument("--newton-block", type=int, default=150,
+                    help="solves of the default run that the block of report steps used "
+                         "by --newton-cost must hold (default 150)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", type=int, nargs="+", default=None,
+                    help="train one ensemble per seed (each with its own validation "
+                         "split) and pack all members into one model; overrides --seed")
 
     # ── Continual learning ──
     cl = ap.add_argument_group("continual learning")
@@ -208,19 +303,22 @@ def main():
                     help="EMA decay for merging Fisher diagonals (default 0.9)")
     args = ap.parse_args()
 
-    X, di, ti, y, deck, grp = load_windows(args.csvs, args.features)
-    print(f"{len(y)} reuse windows from {len(args.csvs)} runs: "
-          f"{dict(Counter(deck.tolist()))}")
+    X, di, ti, y, deck, grp, sweep, newton = load_windows(args.csvs, args.features,
+                                                          args.newton_block)
+    print(f"{len(y)} reuse windows from {len(args.csvs)} runs in "
+          f"{len(set(sweep.tolist()))} sweep(s): {dict(Counter(deck.tolist()))}")
+    y = targets(y, di, ti, deck, grp, sweep, newton, args.relative, args.newton_cost)
     if args.relative:
-        default = (di == 0) & (ti == 0)
-        level = {}
-        for g in set(grp):
-            sel = np.array([h == g for h in grp]) & default
-            if not sel.any():                      # no default window here: deck level
-                sel = (deck == g[0]) & default
-            level[g] = float(y[sel].mean())
-        y = y - np.array([level[g] for g in grp], np.float32)
-        print(f"  relative targets: log cost minus the default pair's mean per (deck, report step)")
+        print("  relative targets: log cost minus the default pair's mean per "
+              "(sweep, deck, report step)")
+    if args.newton_cost:
+        print("  Newton-aware targets: plus log(solves / solves of the default run), per "
+              "deck and pair on average: "
+              + "; ".join(f"{dk} " + " ".join(
+                  f"{100 * (math.exp(float(newton[(deck == dk) & (di == d) & (ti == t)].mean())) - 1):+.0f}%"
+                  for d in range(len(DAMPING)) for t in range(len(TARGET))
+                  if ((deck == dk) & (di == d) & (ti == t)).any())
+                  for dk in sorted(set(deck.tolist()))))
 
     # ── Replay: mix old windows into training data ──
     if args.replay_buffer:
@@ -234,7 +332,7 @@ def main():
         ti = np.concatenate([ti, rdata["ti"][r_idx]])
         y = np.concatenate([y, rdata["y"][r_idx]])
         deck = np.concatenate([deck, rdata["deck"][r_idx]])
-        grp = grp + [tuple(g) for g in rdata["grp"][r_idx]]
+        grp = grp + [(g[0], int(g[1])) for g in rdata["grp"][r_idx]]
         print(f"  Replay: mixed in {n_replay} windows from {args.replay_buffer}")
 
     # ── EWC anchor ──
@@ -248,25 +346,28 @@ def main():
     names, inv, counts = np.unique(deck, return_inverse=True, return_counts=True)
     w = (len(deck) / (len(names) * counts))[inv].astype(np.float32)   # decks weigh equally
 
-    rng = np.random.default_rng(args.seed)
     groups = sorted(set(grp))
-    val = set()
-    for d in names:
-        gd = [g for g in groups if g[0] == d]
-        val.update(gd[i] for i in rng.choice(len(gd), max(1, round(len(gd) * args.val_frac)),
-                                              replace=False))
-    is_val = np.array([g in val for g in grp])
-    tr = np.flatnonzero(~is_val)
-    members = []
-    for j in range(args.ensemble):
-        idx = tr if j == 0 else np.random.default_rng(args.seed + j).choice(tr, len(tr))
-        members.append(train(X[idx], di[idx], ti[idx], y[idx], w[idx], X[is_val], di[is_val],
-                             ti[is_val], y[is_val], w[is_val], args.hidden, args.depth,
-                             args.epochs, args.lr, args.batch, args.seed + j, args.patience,
-                             args.additive,
-                             ewc_anchor=ewc_anchor, ewc_fisher=ewc_fisher,
-                             ewc_lambda=args.ewc_lambda if ewc_anchor else 0.0))
-    mlp = members[0] if args.ensemble == 1 else pack_ensemble(members, args.hidden, args.depth)
+    members, splits = [], []
+    for seed in (args.seeds or [args.seed]):
+        rng = np.random.default_rng(seed)
+        val = set()
+        for d in names:
+            gd = [g for g in groups if g[0] == d]
+            val.update(gd[i] for i in rng.choice(len(gd), max(1, round(len(gd) * args.val_frac)),
+                                                  replace=False))
+        is_val = np.array([g in val for g in grp])
+        tr = np.flatnonzero(~is_val)
+        splits.append((is_val, tr))
+        for j in range(args.ensemble):
+            idx = tr if j == 0 else np.random.default_rng(seed + j).choice(tr, len(tr))
+            members.append(train(X[idx], di[idx], ti[idx], y[idx], w[idx], X[is_val], di[is_val],
+                                 ti[is_val], y[is_val], w[is_val], args.hidden, args.depth,
+                                 args.epochs, args.lr, args.batch, seed + j, args.patience,
+                                 args.additive,
+                                 ewc_anchor=ewc_anchor, ewc_fisher=ewc_fisher,
+                                 ewc_lambda=args.ewc_lambda if ewc_anchor else 0.0))
+    is_val, tr = splits[0]                         # first seed's split, for the checks below
+    mlp = members[0] if len(members) == 1 else pack_ensemble(members, args.hidden, args.depth)
 
     # Offline check of the anchored rule on held-out windows of the default
     # run, each pick priced at its combination's mean cost on the deck.
