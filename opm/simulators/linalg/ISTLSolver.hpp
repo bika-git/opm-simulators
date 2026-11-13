@@ -671,6 +671,8 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         /// Caching policy:
         ///   nnz_per_row    — permanent; sparsity pattern never changes.
         ///   diag_dominance — recomputed on Newton iter 0 only; stable across iters.
+        ///                    Over all owned rows of all ranks, so it does not
+        ///                    depend on the partitioning or the rank count.
         CprPolicyFeatures extractFeatures(const Matrix& M)
         {
             CprPolicyFeatures feat;
@@ -699,8 +701,19 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
             // diag_dominance: recompute only on the first Newton step of each
             // timestep when the matrix reflects the latest linearisation.
-            if (feat.nl_iteration == 0.0)
-                cached_diag_dominance_ = computeDiagDominance(M);
+            // Owner cells come first (enforced in the constructor), so the
+            // owned rows are [0, numOwned); overlap rows are skipped so that
+            // no cell is counted on more than one rank.
+            if (feat.nl_iteration == 0.0) {
+                if (cached_owned_rows_ == 0)
+                    cached_owned_rows_ = detail::numMatrixRowsToUseInSolver(
+                        simulator_.vanguard().grid(), true);
+                const auto [diag_local, off_local] =
+                    computeDiagOffdiagSums(M, std::min(cached_owned_rows_, M.N()));
+                const double diag_sum = gcomm.sum(diag_local);
+                const double off_sum  = gcomm.sum(off_local);
+                cached_diag_dominance_ = (off_sum > 0.0) ? diag_sum / off_sum : 1.0;
+            }
             feat.diag_dominance = cached_diag_dominance_;
 
             // Additional features: linear solver history and problem size.
@@ -787,13 +800,18 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             return feat;
         }
 
-        /// Cheap diagonal-dominance proxy: sample up to 200 block rows.
-        static double computeDiagDominance(const Matrix& M)
+        /// Local part of diag_dominance: the sum of the diagonal and the sum
+        /// of the off-diagonal block Frobenius norms over the first nRows
+        /// (owned) block rows.  The caller adds each over the ranks and takes
+        /// the ratio.  One pass over the owned part of the matrix, once per
+        /// time step.  (Until this change the feature was the mean of the
+        /// per-row ratios over the first 200 rows of each rank's local
+        /// matrix, of which only rank 0's value reached the model.)
+        static std::pair<double, double>
+        computeDiagOffdiagSums(const Matrix& M, const std::size_t nRows)
         {
-            const std::size_t nSample = std::min(M.N(), std::size_t(200));
-            double sumRatio = 0.0;
-            std::size_t count = 0;
-            for (std::size_t i = 0; i < nSample; ++i) {
+            double diagSum = 0.0, offSum = 0.0;
+            for (std::size_t i = 0; i < nRows; ++i) {
                 const auto& row = M[i];
                 double diagN = 0.0, offN = 0.0;
                 for (auto it = row.begin(); it != row.end(); ++it) {
@@ -801,9 +819,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                     if (it.index() == i) diagN += fn;
                     else                  offN  += fn;
                 }
-                if (offN > 0.0) { sumRatio += diagN / offN; ++count; }
+                diagSum += diagN;
+                offSum  += offN;
             }
-            return (count > 0) ? sumRatio / double(count) : 1.0;
+            return {diagSum, offSum};
         }
 
         /// Cheap condition-number proxy: max/min diagonal block norm over sampled rows.
@@ -1437,6 +1456,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         // Feature caches (avoid recomputing invariants)
         mutable double cached_nnz_per_row_         = -1.0;  ///< permanent after first call
         mutable double cached_diag_dominance_       =  1.0;  ///< refreshed on Newton iter 0
+        mutable std::size_t cached_owned_rows_      =  0;    ///< owned (interior) rows of this rank, set once
         mutable double cached_num_wells_            =  0.0;  ///< global well count, refreshed on iter 0
         mutable double cached_global_cells_         =  0.0;  ///< global cell count, refreshed on iter 0
         mutable double cached_condition_number_     =  1.0;  ///< refreshed on Newton iter 0

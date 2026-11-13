@@ -40,7 +40,7 @@ struct CprPolicyFeatures {
     double nl_residual_reduce   = 1.0;  ///< norm / norm_at_nl_iter_0  (1.0 on iter 0)
     double nl_iteration         = 0.0;  ///< Newton iteration index (0-based)
     double nnz_per_row          = 7.0;  ///< average non-zeros per block row (cached)
-    double diag_dominance       = 1.0;  ///< mean ||a_ii||_F / sum_{j≠i} ||a_ij||_F
+    double diag_dominance       = 1.0;  ///< sum_i ||a_ii||_F / sum_i sum_{j≠i} ||a_ij||_F over all owned rows, all ranks
     double prev_linsolver_iters = 0.0;  ///< Krylov iterations in the previous solve
     double prev_solve_failed    = 0.0;  ///< 1.0 if the previous linear solve failed
     double time_elapsed_frac    = 0.0;  ///< simulator.time() / simulator.endTime()
@@ -89,10 +89,12 @@ struct CprPolicyFeatures {
                 std::clamp(std::log10(std::max(condition_number_estimate, 1.0)) / 10.0,
                            0.0, 1.0)),
             c01(bhp_well_fraction),                          // already [0,1]
-            // 19: diag_dominance on a log scale (1 → 0, 1e10 → 1); the linear
-            // transform in slot 6 saturates above 4 on nearly every black-oil solve.
-            static_cast<float>(
-                std::clamp(std::log10(std::max(diag_dominance, 1.0)) / 10.0, 0.0, 1.0)),
+            // 19: diag_dominance on a log scale (0.1 → 0, 1 → 0.25, 1e3 → 1), set
+            // for the ratio of sums over all owned rows: log10 runs from -0.2
+            // (Norne) to 2.1 (SPE11B) in the bulk and up to 6 on the first
+            // tiny steps.  Models trained on the earlier first-200-rows probe
+            // (slot 6, or this slot as log10(max(x,1))/10) are not valid here.
+            c01((std::log10(std::max(diag_dominance, 0.1)) + 1.0) / 4.0),
             // 20: nl_residual_norm on a wider log scale (1e-14 → 0, 1e4 → 1).  Slot 2
             // is not clipped and runs to 1.0..1.22 on black-oil decks (norms 1..1e3
             // in field units); below 1e4 slot 20 is slot 2 scaled by 14/18.

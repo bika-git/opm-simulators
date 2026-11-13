@@ -59,10 +59,12 @@ N_FEAT = 12
 #   6: dt_days, dt_ratio, nl_residual_norm on the wide log scale (slot 20),
 #      nl_residual_reduce, nl_iteration, prev_linsolver_iters: state only, no
 #      diag_dominance and no problem descriptor
-#   7: dt_days, dt_ratio, nl_residual_norm, nl_residual_reduce, nl_iteration,
-#      prev_linsolver_iters, num_cells_log  (hand-picked)
+#   7: the six-input layout plus diag_dominance on the log scale (slot 19,
+#      ratio of sums over all owned rows) before prev_linsolver_iters.  The
+#      earlier hand-picked layout 0,1,2,3,4,7,10 (with num_cells_log) has to be
+#      given explicitly now.
 #   8, 9, 10: best sets of that size in the same search
-AMG_LAYOUTS = {5: [1, 2, 3, 6, 10], 6: [0, 1, 20, 3, 4, 7], 7: [0, 1, 2, 3, 4, 7, 10],
+AMG_LAYOUTS = {5: [1, 2, 3, 6, 10], 6: [0, 1, 20, 3, 4, 7], 7: [0, 1, 20, 3, 4, 19, 7],
                8: [0, 1, 2, 5, 6, 7, 10, 11], 9: [0, 2, 3, 5, 6, 7, 9, 10, 11],
                10: [0, 1, 2, 3, 4, 5, 6, 7, 10, 11], 12: list(range(12))}
 AMG_FEATURES = AMG_LAYOUTS[7]

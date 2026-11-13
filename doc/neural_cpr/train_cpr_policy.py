@@ -125,9 +125,11 @@ def normalise(row: dict) -> np.ndarray:
             math.log10(max(float(row.get("condition_number_estimate", "1.0")), 1.0)) / 10.0,
             0.0, 1.0)),
         c01(float(row.get("bhp_well_fraction", "0.0"))),
-        # 19: diag_dominance on a log scale (1 → 0, 1e10 → 1); the linear
-        # transform in slot 6 saturates above 4 on nearly every black-oil solve.
-        c01(math.log10(max(float(row["diag_dominance"]), 1.0)) / 10.0),
+        # 19: diag_dominance on a log scale (0.1 → 0, 1 → 0.25, 1e3 → 1), for the
+        # ratio of sums over all owned rows of all ranks.  Sweep CSVs written by
+        # builds with the earlier first-200-rows probe hold a different quantity
+        # (1..1e10) in this column and cannot be used for slots 6 and 19.
+        c01((math.log10(max(float(row["diag_dominance"]), 0.1)) + 1.0) / 4.0),
         # 20: nl_residual_norm on a wider log scale (1e-14 → 0, 1e4 → 1).  Slot 2
         # is not clipped and runs to 1.0..1.22 on black-oil decks (norms 1..1e3
         # in field units); below 1e4 slot 20 is slot 2 scaled by 14/18.

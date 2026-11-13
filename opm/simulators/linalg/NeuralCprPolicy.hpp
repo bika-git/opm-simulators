@@ -109,9 +109,11 @@ public:
         //    nl_residual_reduce, nl_iteration, prev_linsolver_iters: state
         //    only, no diag_dominance and no problem descriptor
         static constexpr std::array<int, 6> k6{0, 1, 20, 3, 4, 7};
-        // 7: dt_days, dt_ratio, nl_residual_norm, nl_residual_reduce, nl_iteration,
-        //    prev_linsolver_iters, num_cells_log
-        static constexpr std::array<int, 7> k7{0, 1, 2, 3, 4, 7, 10};
+        // 7: the six-input layout plus diag_dominance on the log scale (slot
+        //    19, ratio of sums over all owned rows) before prev_linsolver_iters.
+        //    The earlier hand-picked seven-input layout 0,1,2,3,4,7,10 (with
+        //    num_cells_log) now needs OPM_NEURAL_CPR_AMG_FEATURES.
+        static constexpr std::array<int, 7> k7{0, 1, 20, 3, 4, 19, 7};
         static constexpr std::array<int, 8> k8{0, 1, 2, 5, 6, 7, 10, 11};
         static constexpr std::array<int, 9> k9{0, 2, 3, 5, 6, 7, 9, 10, 11};
         static constexpr std::array<int, 10> k10{0, 1, 2, 3, 4, 5, 6, 7, 10, 11};

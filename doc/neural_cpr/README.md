@@ -44,8 +44,10 @@ Models with fewer inputs read a reduced layout, recognised by the input count
 (`AMG_LAYOUTS` in `train_cpr_amg_policy.py`, `NeuralCprPolicy::amgFeatureIndex`).
 The six-input layout `0,1,20,3,4,7` reads solver state only: time step, time
 step ratio, residual norm, residual reduction, Newton iteration and the
-previous solve's Krylov iterations. Trained models and how each was made are
-listed in `models/README.md`.
+previous solve's Krylov iterations. The seven-input layout `0,1,20,3,4,19,7`
+adds `diag_dominance`, the sum of the diagonal block norms over the sum of the
+off-diagonal block norms, taken over all owned rows of all ranks. Trained
+models and how each was made are listed in `models/README.md`.
 
 ### Neural abort
 
@@ -159,6 +161,11 @@ python train_cpr_amg_policy.py \
 python train_cpr_amg_policy.py \
     --csvs amg_sweep/*_pd*_ct*.csv --features 6 --relative --newton-cost \
     --seeds 42 100 200 --out cpr_amg_policy_6feat.model
+
+# the same with diag_dominance over all rows as a seventh input
+python train_cpr_amg_policy.py \
+    --csvs amg_sweep/*_pd*_ct*.csv --features 7 --relative --newton-cost \
+    --seeds 42 100 200 --out cpr_amg_policy_7feat.model
 
 # Abort policy (from sweep .DBG logs)
 python train_abort_policy.py \
