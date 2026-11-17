@@ -465,6 +465,30 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                                  "coarsening target, min gain " + std::to_string(min_gain_));
             }
 
+            // OPM_NEURAL_CPR_AMG_WEIGHTS=file: a second, AMG-parameter model
+            // that runs together with the variant model of OPM_NEURAL_CPR_WEIGHTS.
+            // At each setup rebuild the variant model picks the CPR variant,
+            // then this model picks the pressure AMG's damping and coarsening
+            // target for it, anchored on the defaults with
+            // OPM_NEURAL_CPR_AMG_MIN_GAIN (default 0.05).  Ignored with
+            // OPM_NEURAL_CPR_ACTIONS=amg, where the main model is the AMG model.
+            if (const char* amg_path = std::getenv("OPM_NEURAL_CPR_AMG_WEIGHTS");
+                amg_path && *amg_path && !amg_mode_) {
+                amg_policy_ = std::make_unique<NeuralCprPolicy>(amg_path);
+                if (const char* g = std::getenv("OPM_NEURAL_CPR_AMG_MIN_GAIN"))
+                    amg_min_gain_ = std::stof(g);
+                if (!amg_policy_->isLoaded()) {
+                    amg_policy_.reset();
+                    if (rank0)
+                        OpmLog::warning("NeuralCprPolicy: could not load AMG model "
+                                        + std::string(amg_path) + "; AMG parameters stay at their defaults");
+                } else if (rank0) {
+                    OpmLog::info("NeuralCprPolicy: AMG model " + std::string(amg_path)
+                                 + " chooses damping and coarsening target after the variant, min gain "
+                                 + std::to_string(amg_min_gain_));
+                }
+            }
+
             if (rank0) {
                 if (neural_policy_->isLoaded())
                     OpmLog::info("NeuralCprPolicy: loaded model from "
@@ -490,10 +514,14 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                            "nl_iteration,nnz_per_row,diag_dominance,"
                            "prev_linsolver_iters,prev_solve_failed,"
                            "time_elapsed_frac,num_cells_log,block_size,"
-                           "setup_rebuilt,setup_ms,solve_ms\n";
-                           // "well_density,nl_residual_trend,"
-                           // "num_phases,dt_cut_count,prev2_linsolver_iters,"
-                           // "condition_number_estimate,bhp_well_fraction\n";
+                           "setup_rebuilt,setup_ms,solve_ms,"
+                           // Slots 12-18 of toArray(), so a model trained on
+                           // these CSVs has seen every input it reads at run
+                           // time.  After solve_ms, so the columns before keep
+                           // their positions.
+                           "well_density,nl_residual_trend,"
+                           "num_phases,dt_cut_count,prev2_linsolver_iters,"
+                           "condition_number_estimate,bhp_well_fraction\n";
                 }
                 OpmLog::info("NeuralCprPolicy: sweep logging to "
                              + std::string(log_path));
@@ -655,14 +683,14 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 << last_feat_.block_size           << ","
                 << (last_setup_rebuilt_ ? 1 : 0)   << ","
                 << last_setup_ms_                  << ","
-                << solve_ms                        << "\n";
-                // << last_feat_.well_density               << ","
-                // << last_feat_.nl_residual_trend          << ","
-                // << last_feat_.num_phases                 << ","
-                // << last_feat_.dt_cut_count               << ","
-                // << last_feat_.prev2_linsolver_iters      << ","
-                // << last_feat_.condition_number_estimate  << ","
-                // << last_feat_.bhp_well_fraction          << "\n";
+                << solve_ms                        << ","
+                << last_feat_.well_density               << ","
+                << last_feat_.nl_residual_trend          << ","
+                << last_feat_.num_phases                 << ","
+                << last_feat_.dt_cut_count               << ","
+                << last_feat_.prev2_linsolver_iters      << ","
+                << last_feat_.condition_number_estimate  << ","
+                << last_feat_.bhp_well_fraction          << "\n";
             sweep_log_->flush();
         }
 
@@ -864,33 +892,52 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             if (!create)
                 return;
 
-            const bool rank0 = (simulator_.gridView().comm().rank() == 0);
-
             if (amg_mode_) {
-                // Choose the AMG parameter levels for the setup about to be
-                // built; the default levels after a failed solve.  Rank 0
-                // decides, all ranks apply the same.
-                int choice[2] = {0, 0};
-                float gain = 0.0f;
-                if (rank0 && !last_solve_failed_) {
-                    const auto [d, t] = neural_policy_->chooseAmgAnchored(feat, min_gain_, &gain);
-                    choice[0] = d;
-                    choice[1] = t;
-                }
-                if (isParallel())
-                    simulator_.gridView().comm().broadcast(choice, 2, 0);
-                const std::string amg = "preconditioner.coarsesolver.preconditioner.";
-                auto& prm = prm_[activeSolverNum_];
-                prm.put(amg + "prolongationdamping", NeuralCprPolicy::kAmgDamping[choice[0]]);
-                prm.put(amg + "coarsenTarget", NeuralCprPolicy::kAmgCoarsenTarget[choice[1]]);
-                if (rank0)
-                    OpmLog::debug("NeuralCprPolicy AMG decision damping="
-                                  + std::to_string(NeuralCprPolicy::kAmgDamping[choice[0]])
-                                  + " coarsenTarget="
-                                  + std::to_string(NeuralCprPolicy::kAmgCoarsenTarget[choice[1]])
-                                  + " gain=" + std::to_string(gain));
+                applyAmgChoice(*neural_policy_, min_gain_, feat);
                 return;
             }
+
+            applyVariantChoice(feat);
+
+            // The variant's tree is final now (patched, rebuilt or unchanged);
+            // set the AMG parameters on it.
+            if (amg_policy_)
+                applyAmgChoice(*amg_policy_, amg_min_gain_, feat);
+        }
+
+        /// Choose the AMG parameter levels for the setup about to be built;
+        /// the default levels after a failed solve.  Rank 0 decides, all ranks
+        /// apply the same.
+        void applyAmgChoice(const NeuralCprPolicy& policy, float min_gain,
+                            const CprPolicyFeatures& feat)
+        {
+            const bool rank0 = (simulator_.gridView().comm().rank() == 0);
+            int choice[2] = {0, 0};
+            float gain = 0.0f;
+            if (rank0 && !last_solve_failed_) {
+                const auto [d, t] = policy.chooseAmgAnchored(feat, min_gain, &gain);
+                choice[0] = d;
+                choice[1] = t;
+            }
+            if (isParallel())
+                simulator_.gridView().comm().broadcast(choice, 2, 0);
+            const std::string amg = "preconditioner.coarsesolver.preconditioner.";
+            auto& prm = prm_[activeSolverNum_];
+            prm.put(amg + "prolongationdamping", NeuralCprPolicy::kAmgDamping[choice[0]]);
+            prm.put(amg + "coarsenTarget", NeuralCprPolicy::kAmgCoarsenTarget[choice[1]]);
+            if (rank0)
+                OpmLog::debug("NeuralCprPolicy AMG decision damping="
+                              + std::to_string(NeuralCprPolicy::kAmgDamping[choice[0]])
+                              + " coarsenTarget="
+                              + std::to_string(NeuralCprPolicy::kAmgCoarsenTarget[choice[1]])
+                              + " gain=" + std::to_string(gain));
+        }
+
+        /// Choose the CPR variant for the setup about to be built and update
+        /// prm_ for it.
+        void applyVariantChoice(const CprPolicyFeatures& feat)
+        {
+            const bool rank0 = (simulator_.gridView().comm().rank() == 0);
 
             // Softmax confidence (classifier) or predicted log-cost gain over
             // the anchor (anchored cost-model mode); used for logging.
@@ -1443,6 +1490,9 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
         float           min_gain_             = 0.05f; ///< log-cost gain needed to leave the anchor
         int             anchor_label_         = 12;    ///< flow-default solver (8 on decks without wells)
         bool            amg_mode_             = false; ///< choose AMG parameters (OPM_NEURAL_CPR_ACTIONS=amg)
+        /// AMG-parameter model run after the variant model (OPM_NEURAL_CPR_AMG_WEIGHTS)
+        std::unique_ptr<NeuralCprPolicy> amg_policy_;
+        float           amg_min_gain_         = 0.05f; ///< its min gain (OPM_NEURAL_CPR_AMG_MIN_GAIN)
         bool            last_solve_failed_    = false;
         bool            policy_cfg_valid_     = false;  ///< true once last_policy_cfg_ is set
         CprPolicyAction last_policy_cfg_;               ///< last action written into prm_

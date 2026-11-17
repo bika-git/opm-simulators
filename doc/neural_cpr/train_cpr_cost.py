@@ -108,11 +108,54 @@ def modelled_ms(rows):
     return np.where(rebuilt, rebuild_ms, update_ms) + s0 + s1 * its
 
 
-def load_rows(paths, merge_decks, windows=False, denoise=False):
-    """Return X (n×12), label (n), log_ms (n), group id (n), deck (n), key (n),
+def newton_factors(raw, run_of, samples, merge_decks, block_solves):
+    """log(solves of the sample's run / solves of the anchor run of the same
+    sweep and deck), both counted over the smallest block of report steps
+    centred on the sample's step in which the anchor run has at least
+    block_solves solves (the whole run if it has fewer); 0 where the sweep has
+    no anchor run of the deck.  The anchor is the flow-default solver: label 12
+    (cprw) on decks with wells, label 8 (cpr) on decks in merge_decks.  As
+    --newton-cost in train_cpr_amg_policy.py: a config is also charged for the
+    Newton iterations and timestep cuts it causes, which the cost of a single
+    solve does not show."""
+    solves = defaultdict(Counter)                 # run -> solves per report step
+    anchor_run = {}                               # (sweep, deck) -> run
+    for r, run in zip(raw, run_of):
+        solves[run][int(r["episode"])] += 1
+        deck = r["deck"]
+        no_wells = merge_decks is None or deck in merge_decks
+        if config_to_label(r["config"]) == (8 if no_wells else 12):
+            anchor_run[(str(Path(run).parent), deck)] = run
+    blocks = {}
+    out = np.zeros(len(samples), np.float32)
+    for j, (run, deck, episode) in enumerate(samples):
+        ref = anchor_run.get((str(Path(run).parent), deck))
+        if ref is None:
+            continue
+        n0 = solves[ref]
+        key = (ref, episode)
+        if key not in blocks:
+            eps = sorted(n0)
+            i = min(range(len(eps)), key=lambda k: abs(eps[k] - episode))
+            lo = hi = i
+            while (sum(n0[eps[k]] for k in range(lo, hi + 1)) < block_solves
+                   and (lo > 0 or hi < len(eps) - 1)):
+                lo, hi = max(lo - 1, 0), min(hi + 1, len(eps) - 1)
+            blocks[key] = eps[lo:hi + 1]
+        steps = blocks[key]
+        n = solves[run]
+        out[j] = math.log(max(sum(n.get(k, 0) for k in steps), 1)
+                          / sum(n0[k] for k in steps))
+    return out
+
+
+def load_rows(paths, merge_decks, windows=False, denoise=False, newton_block=None):
+    """Return X (n×N_FEAT), label (n), log_ms (n), group id (n), deck (n), key (n),
     the raw rows (for --dump-combined) and the source of each sample.
 
     merge_decks: decks on which cprw:* is treated as cpr:* (None = all).
+
+    newton_block: if set, add newton_factors() to each sample's log cost.
 
     windows: for sweeps run with CPR setup reuse (CSV has setup_rebuilt).  The
     policy can only switch config when the setup is rebuilt, so each sample is
@@ -122,7 +165,14 @@ def load_rows(paths, merge_decks, windows=False, denoise=False):
 
     denoise: use modelled_ms() instead of the measured total_ms."""
     X, lab, y, grp, deck_of, key_of, src_of = [], [], [], [], [], [], []
-    raw = [dict(row, deck=deck, source=src) for deck, src, row in iter_rows(paths)]
+    raw, run_of = [], []
+    for path in paths:
+        for deck, src, row in iter_rows([path]):
+            raw.append(dict(row, deck=deck, source=src))
+            # One run = one per-config CSV; sweeps of the same decks in other
+            # directories share file names, so the path tells them apart.
+            run_of.append(path if "source" not in row else row["source"])
+    sample_run = []                               # (run, deck, episode) per sample
     if denoise:
         if "setup_rebuilt" not in raw[0]:
             sys.exit("--denoise needs setup_rebuilt/setup_ms/solve_ms columns")
@@ -139,7 +189,7 @@ def load_rows(paths, merge_decks, windows=False, denoise=False):
             y[win[0]] = math.log(max(win[1] / win[2], 1e-3))
 
     source = None
-    for row in raw:
+    for row, run in zip(raw, run_of):
         deck, src = row["deck"], row["source"]
         # Rows of one source (one config run) are in simulation order.
         if src != source:
@@ -173,9 +223,21 @@ def load_rows(paths, merge_decks, windows=False, denoise=False):
         # used only for the matched-solve evaluation below.
         key_of.append((deck, episode, attempt, row["dt_days"], row["newton_iter"]))
         src_of.append(src)
+        sample_run.append((run, deck, int(episode)))
     close_window()
     for r in raw:
         r.pop("_ms", None)
+    if newton_block is not None:
+        nf = newton_factors(raw, run_of, sample_run, merge_decks, newton_block)
+        y = [v + float(f) for v, f in zip(y, nf)]
+        deck_arr = np.asarray(deck_of)
+        lab_arr = np.asarray(lab)
+        print("Newton factor (solves of the config's run / solves of the anchor run), mean per deck:")
+        for d in sorted(set(deck_of)):
+            m = deck_arr == d
+            per = {int(k): math.exp(float(nf[m & (lab_arr == k)].mean())) - 1
+                   for k in np.unique(lab_arr[m])}
+            print(f"  {d:16s} " + "  ".join(f"{k}:{100*v:+.0f}%" for k, v in sorted(per.items())))
     return (np.asarray(X, np.float32), np.asarray(lab), np.asarray(y, np.float32),
             grp, np.asarray(deck_of), key_of, raw, np.asarray(src_of))
 
@@ -401,11 +463,24 @@ def main():
     ap.add_argument("--baseline", type=int, default=8,
                     help="Fixed config to compare against in evaluation")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--newton-cost", action="store_true",
+                    help="Add log(solves of the config's run / solves of the "
+                         "flow-default run) around each sample's report step "
+                         "to its target, as in train_cpr_amg_policy.py")
+    ap.add_argument("--newton-block", type=int, default=150,
+                    help="Minimum solves of the default run in the block of "
+                         "report steps used by --newton-cost (default 150)")
+    ap.add_argument("--n-features", type=int, default=12,
+                    help="Model inputs: the leading N of CprPolicyFeatures::toArray() "
+                         "(12, or 21 for sweeps that log the slot 12-18 columns)")
     args = ap.parse_args()
 
+    global N_FEAT
+    N_FEAT = args.n_features
     merge = None if args.merge_cprw else set(args.merge_cprw_decks)
-    X, lab, y, grp, deck, key, raw, src_of = load_rows(args.csvs, merge, args.windows,
-                                                       args.denoise)
+    X, lab, y, grp, deck, key, raw, src_of = load_rows(
+        args.csvs, merge, args.windows, args.denoise,
+        args.newton_block if args.newton_cost else None)
     print(f"Read {len(raw)} rows from {len(args.csvs)} files → {len(y)} "
           f"{'reuse windows' if args.windows else 'samples'}")
     for d in sorted(set(deck)):
